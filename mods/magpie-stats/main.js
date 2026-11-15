@@ -953,6 +953,7 @@ export default class MagpieStats extends View {
                 .cursor_pointer().rounded(3)
                 .hover((s) => s.text_color(t.blocked))
                 .tooltip(`Remove ${instance.name}`)
+                .on_mouse_down("left", (_e2, cx) => cx.stop_propagation())
                 .on_click((_e2, cx) => this.removeInstance(cx, instance.id))
                 .child("✕")));
         })))
