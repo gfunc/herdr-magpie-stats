@@ -49,8 +49,9 @@ One block in the left sidebar, 240 px tall, on the sidebar's background
   agent routed traffic in the period. One agent at 100% tells you nothing, so
   the section is omitted.
 
-Narrow the sidebar under 160 px and the block becomes a rail: one "M" with the
-status dot, hover for a summary (status, cost, calls, last update), click to
+Narrow the sidebar under 160 px and the block becomes a rail: the selected
+gateway's first letter with its status dot, plus one dot per other watched
+gateway. Hover for a summary (status, cost, calls, last update), click to
 refresh.
 
 ## How it behaves

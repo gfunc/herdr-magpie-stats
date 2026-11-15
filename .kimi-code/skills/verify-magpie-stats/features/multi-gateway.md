@@ -52,5 +52,5 @@ the file drives below.
    expands). `/var/tmp` paths are rejected by design — point scratch
    gateways at `~/.config/<name>/`.
 - The add form is click-only; its validation layer (`parseInstanceDraft`)
-   is covered by the unit harness at `.scratch/multi-and-skills/logs/registry-unit.mjs`
-   (extracts the real functions from main.js; rerun after touching them).
+   is covered by the unit harness shipped with the formal skill:
+   `node .kimi-code/skills/verify-magpie-stats-registry/unit.mjs`.

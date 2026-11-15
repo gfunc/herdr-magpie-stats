@@ -1,6 +1,6 @@
 ---
 name: verify-magpie-stats-registry
-description: Formally check the magpie-stats gateway-registry core — convergence of concurrent compare-and-swap updates, validator totality, retry idempotence — by exhaustive interleaving over the real functions extracted from mods/magpie-stats/main.js. Use after any change to parseRegistry, applyRegistryChange, readRegistry, updateRegistry, parseInstanceDraft, or the registry file format.
+description: Formally check the magpie-stats gateway-registry core — convergence of concurrent compare-and-swap updates, validator totality, retry idempotence — by systematic interleaving over the real functions extracted from mods/magpie-stats/main.js. Use after any change to parseRegistry, applyRegistryChange, readRegistry, updateRegistry, parseInstanceDraft, or the registry file format.
 ---
 
 # Registry formal check
@@ -35,7 +35,7 @@ broken watch list instead of the quiet last-good-list fallback.
 
 ## Tool and why
 
-A purpose-built exhaustive-interleaving checker (`check.mjs`, Node, no
+A purpose-built interleaving checker (`check.mjs`, Node, no
 dependencies), not a model checker: the functions are pure given the file
 API, so the check extracts them verbatim from `main.js` and drives every
 interleaving their `await` points actually create — both writers' orders,
@@ -51,7 +51,14 @@ node .kimi-code/skills/verify-magpie-stats-registry/check.mjs
 ```
 
 Exit 0 and `all properties hold on the real code` is the pass. One run is
-~26 checks, well under a second.
+~27 checks, well under a second.
+
+The add-form validation boundary (`parseInstanceDraft`) is covered by the
+unit harness, not the interleaving checker:
+
+```sh
+node .kimi-code/skills/verify-magpie-stats-registry/unit.mjs
+```
 
 ## Able to fail
 
@@ -77,7 +84,7 @@ Fix the anchor (the exact strings in `breakBodies`), not the property.
 | `applyRegistryChange` | 1, 3 |
 | `readRegistry` | 1 |
 | `updateRegistry` (CAS retry loop) | 1, 3 |
-| `parseInstanceDraft`, `expandTilde`, `isAbsolutePath`, `isUnderHome` | extracted; exercised via validator corpus paths |
+| `parseInstanceDraft`, `expandTilde`, `isAbsolutePath`, `isUnderHome` | unit.mjs (draft validation) and validator corpus paths |
 
 The extraction is by function-boundary scan of `main.js`. If you rename or
 move any listed function, update `NAMES` in `check.mjs`.

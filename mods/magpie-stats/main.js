@@ -678,11 +678,6 @@ export default class MagpieStats extends View {
    * @param {import("gpui-kit").Context} cx
    */
   refreshVisible(cx) {
-    const selected = this.selectedInstance();
-    if (this.picker === "off") {
-      this.refresh(cx, selected, this.periodFor(selected.id), false);
-      return;
-    }
     for (const instance of this.instances()) {
       this.refresh(cx, instance, this.periodFor(instance.id), false);
     }
@@ -787,12 +782,14 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * Show the add form, prefilled with the next free gateway number.
+   * Show the add form, prefilled with the next unused gateway number.
    */
   showAdd(cx) {
     this.picker = "add";
     this.addProblem = null;
-    const n = this.registry.additional.length + 2;
+    const taken = new Set(this.registry.additional.map((entry) => entry.name.toLowerCase()));
+    let n = this.registry.additional.length + 2;
+    while (taken.has(`magpie-${n}`)) n++;
     this.nameState.set_value(`magpie-${n}`);
     this.pathState.set_value(`~/.config/magpie/gateway-${n}.json`);
     cx.notify();

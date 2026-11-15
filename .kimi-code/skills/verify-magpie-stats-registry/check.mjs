@@ -131,6 +131,15 @@ async function propertyConvergence(bodies) {
       check(`no-duplicates ${label}/racer=${racer}`, new Set(final.additional.map(e => e.id)).size === final.additional.length);
     }
   }
+  // create-on-absent: the first write ever must expect a null file
+  {
+    const store = makeStore(null);
+    const api = makeApi(bodies, store);
+    const out = await api.updateRegistry({ kind: "add", instance: inst(1) });
+    const parsed = api.parseRegistry(store.raw);
+    check("first write on an absent file lands", parsed.additional.map(e => e.id).join(",") === "i-1" && store.raw !== null,
+      `file now ${store.raw}`);
+  }
 }
 
 async function propertyIdempotence(bodies) {
