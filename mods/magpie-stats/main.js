@@ -1,11 +1,21 @@
-import { View, div } from "gpui-kit";
+import { View, div, image, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home, appHome, readTextFile, writeTextFile, theme } from "herdr";
 import { URL } from "url";
 
 const REFRESH_MS = 30_000;
 const CHART_LIMIT = 30;
-const QUOTA_LIMIT = 4;
+const QUOTA_LEFT_KEY = "magpie-stats.quotaLeft";
+const FOLDED_KEY = "magpie-stats.folded";
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ICON_FILES = {
+  kimi: "kimi.svg",
+  "deepseek-color": "deepseek-color.svg",
+  magpie: "magpie.svg",
+  githubcopilot: "githubcopilot.svg",
+  zcode: "zcode.png",
+};
 
 // Rail, narrow, medium and wide, by the panel's own width. The content is one
 // 560 column until it can hold two of them side by side.
@@ -59,11 +69,12 @@ const PERIODS = /** @type {const} */ ([
  * none.
  *
  * @typedef {{
- *   id: string, name: string, detail: string,
+ *   id: string, name: string, detail: string, icon: string,
  *   calls: number, errors: number, retried: number, canceled: number, loops: number,
  *   cost: number, unpriced: number,
  *   input: number, output: number,
  *   cacheRead: number, cacheWrite: number, reasoning: number,
+ *   credits: number, credited: number,
  *   tokens: number, timed: number, ttftMs: number, decodeMs: number, decodeOut: number,
  *   decodeN: number, ownCalls: number, share: number
  * }} UsageRow
@@ -86,7 +97,7 @@ const PERIODS = /** @type {const} */ ([
 
 /**
  * @typedef {{
- *   period: Period, receivedAt: number, totals: Totals, chart: Chart,
+ *   period: Period, receivedAt: number, path: string, totals: Totals, chart: Chart,
  *   agents: UsageRow[], models: UsageRow[], accounts: UsageRow[], keys: UsageRow[]
  * }} UsagePageSnapshot
  */
@@ -100,21 +111,42 @@ const PERIODS = /** @type {const} */ ([
 
 /**
  * @typedef {{
+ *   tokens: number, cost: number, priced: boolean, used: number,
+ *   calls: number, routedTokens: number, cacheRead: number
+ * }} QuotaHolds
+ */
+
+/**
+ * @typedef {{
  *   name: string, used: number | null, remaining: number | null,
- *   unlimited: boolean, display: string, unit: string,
- *   balance: number | null, resetsAt: string
+ *   amount: number, limit: number, unit: string,
+ *   unlimited: boolean, text: boolean, display: string,
+ *   balance: number | null, spent: number | null,
+ *   resetsAt: string, runsOutAt: string, runsOut: number,
+ *   holds: QuotaHolds | null, holdsWhy: string
  * }} QuotaWindow
  */
 
 /**
  * `pressure` is the lowest remaining among finite, limited windows; `worst`
- * holds it.
+ * holds it. `lines` is the account's history, one entry per window name.
  * @typedef {{
  *   id: string, provider: string, name: string, kind: string,
- *   plan: string, user: string, balance: string, error: string,
+ *   plan: string, user: string, alias: string, seat: string,
+ *   balance: string, error: string, icon: string,
+ *   until: string, renew: string, asOf: string, readAt: string,
  *   windows: QuotaWindow[], pressure: number | null, worst: QuotaWindow | null,
- *   readAt: string
+ *   lines: QuotaLine[]
  * }} QuotaAccount
+ */
+
+/**
+ * One window's readings over time. Times are epoch milliseconds; start and
+ * reset are null when the reading didn't carry them.
+ * @typedef {{
+ *   name: string,
+ *   points: {at: number, left: number, start: number | null, reset: number | null}[]
+ * }} QuotaLine
  */
 
 /** @typedef {{receivedAt: number, accounts: QuotaAccount[]}} QuotaSnapshot */
@@ -519,6 +551,10 @@ async function loadUsage(instance, period) {
 }
 
 /**
+ * The snapshot plus the two optional reads. Cards carry the provider icons
+ * and history the curves; either endpoint missing leaves the panel with no
+ * icons or no curve, never an error state.
+ *
  * @param {GatewayInstance} instance
  * @returns {Promise<QuotaSnapshot>}
  */
@@ -528,7 +564,119 @@ async function loadQuota(instance) {
   const response = await fetch(url, headers ? { headers } : undefined);
   const problem = responseProblem(response, url);
   if (problem !== null) throw problem;
-  return parseQuota(await response.json(), Date.now());
+  const snapshot = parseQuota(await response.json(), Date.now());
+  const [cards, history, remote] = await Promise.all([
+    loadOptional(`${origin}/v1/magpie/quotas/cards`, headers),
+    loadOptional(`${origin}/v1/magpie/quotas/history?days=45`, headers),
+    loadRemoteHistories(snapshot),
+  ]);
+  return mergeQuotaExtras(snapshot, cards, history, remote);
+}
+
+/**
+ * The histories of the remote magpies this computer's providers name, as
+ * the Usage page's own read merges them: a gateway answers its own accounts'
+ * history only, and a remote account's curve lives on that remote. Each
+ * entry's provider gains the remote's id, the way magpie names them.
+ *
+ * @param {QuotaSnapshot} snapshot
+ * @returns {Promise<unknown[]>}
+ */
+async function loadRemoteHistories(snapshot) {
+  let text;
+  try {
+    text = await readTextFile(`${home()}/.config/magpie/providers.json`);
+  } catch {
+    return [];
+  }
+  if (text === null) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const providers = typeof parsed === "object" && parsed !== null && Array.isArray(parsed.providers) ? parsed.providers : [];
+  const wanted = new Set(snapshot.accounts.map((a) => a.provider.split("/")[0]));
+  const remotes = providers.filter((p) => typeof p === "object" && p !== null &&
+    p.preset === "remote-magpie" && p.off !== true && typeof p.id === "string" && wanted.has(p.id) &&
+    typeof p.key === "string" && p.key !== "" && typeof p.anthropic === "string" && /^https?:\/\//.test(p.anthropic));
+  const lists = await Promise.all(remotes.map(async (p) => {
+    const raw = await loadOptional(`${p.anthropic.replace(/\/$/, "")}/v1/magpie/quotas/history?days=45`, { Authorization: `Bearer ${p.key}` });
+    const data = typeof raw === "object" && raw !== null && Array.isArray(/** @type {any} */ (raw).data) ? /** @type {any} */ (raw).data : [];
+    return data.map((entry) => (typeof entry === "object" && entry !== null && typeof entry.provider === "string"
+      ? { ...entry, provider: `${p.id}/${entry.provider}` }
+      : entry));
+  }));
+  return lists.flat();
+}
+
+/**
+ * A read the panel can do without: any failure, including a malformed
+ * payload, answers null and the caller falls back.
+ *
+ * @param {string} url
+ * @param {Record<string, string> | undefined} headers
+ * @returns {Promise<unknown | null>}
+ */
+async function loadOptional(url, headers) {
+  try {
+    const response = await fetch(url, headers ? { headers } : undefined);
+    if (responseProblem(response, url) !== null) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold the cards' icons and the history's lines into the snapshot by
+ * provider and user. Both extras are optional data: a junk entry is skipped,
+ * never thrown, so one bad card cannot take the allowances down.
+ *
+ * @param {QuotaSnapshot} snapshot
+ * @param {unknown} cardsRaw
+ * @param {unknown} historyRaw
+ * @param {unknown[]} remoteHistories
+ * @returns {QuotaSnapshot}
+ */
+function mergeQuotaExtras(snapshot, cardsRaw, historyRaw, remoteHistories = []) {
+  const icons = new Map();
+  if (typeof cardsRaw === "object" && cardsRaw !== null && Array.isArray(/** @type {any} */ (cardsRaw).data)) {
+    for (const entry of /** @type {any} */ (cardsRaw).data) {
+      if (typeof entry !== "object" || entry === null) continue;
+      if (typeof entry.provider !== "string" || typeof entry.icon !== "string") continue;
+      icons.set(`${entry.provider}\n${optionalString(entry.user).toLowerCase()}`, entry.icon);
+    }
+  }
+  const lines = new Map();
+  const addHistory = (entry) => {
+    if (typeof entry !== "object" || entry === null || typeof entry.provider !== "string") return;
+    const parsed = [];
+    for (const line of Array.isArray(entry.lines) ? entry.lines : []) {
+      if (typeof line !== "object" || line === null || typeof line.name !== "string" || !Array.isArray(line.points)) continue;
+      const points = [];
+      for (const point of line.points) {
+        if (typeof point !== "object" || point === null) continue;
+        const at = parseTime(point.at);
+        const left = optionalFinite(point.left);
+        if (at === null || left === null) continue;
+        points.push({ at, left, start: parseTime(point.start), reset: parseTime(point.resetsAt) });
+      }
+      if (points.length > 0) parsed.push({ name: line.name, points });
+    }
+    if (parsed.length > 0) lines.set(`${entry.provider}\n${optionalString(entry.user).toLowerCase()}`, parsed);
+  };
+  if (typeof historyRaw === "object" && historyRaw !== null && Array.isArray(/** @type {any} */ (historyRaw).data)) {
+    for (const entry of /** @type {any} */ (historyRaw).data) addHistory(entry);
+  }
+  for (const entry of remoteHistories) addHistory(entry);
+  for (const account of snapshot.accounts) {
+    const key = `${account.provider}\n${account.user.toLowerCase()}`;
+    account.icon = icons.get(key) ?? "";
+    account.lines = lines.get(key) ?? [];
+  }
+  return snapshot;
 }
 
 function finiteNonnegative(value) {
@@ -648,7 +796,7 @@ function parseUsage(raw, period, receivedAt) {
   const keys = listOf(obj, "callerKeys").map((entry) => parseUsageRow(entry, periodTokens, {
     name: ["callerKeyName", "name", "callerKeyId"], detail: ["sub", "provider"],
   }));
-  return { period, receivedAt, totals, chart, agents, models, accounts, keys };
+  return { period, receivedAt, path: optionalString(obj.path), totals, chart, agents, models, accounts, keys };
 }
 
 /**
@@ -678,6 +826,7 @@ function parseUsageRow(raw, periodTokens, fallbacks) {
     id: typeof obj.id === "string" ? obj.id : "",
     name: pick(fallbacks.name) || fallbacks.emptyName || "",
     detail: pick(fallbacks.detail),
+    icon: optionalString(obj.icon),
     calls: requiredNumber(obj, "calls"),
     errors: requiredNumber(obj, "errors"),
     retried: optionalNumber(obj, "retried"),
@@ -689,6 +838,8 @@ function parseUsageRow(raw, periodTokens, fallbacks) {
     cacheRead: optionalNumber(obj, "cache_read"),
     cacheWrite: optionalNumber(obj, "cache_write"),
     reasoning: optionalNumber(obj, "reasoning"),
+    credits: optionalNumber(obj, "credits"),
+    credited: optionalNumber(obj, "credited"),
     tokens: input + output,
     timed: optionalNumber(obj, "timed"),
     ttftMs: optionalNumber(obj, "ttft_ms"),
@@ -760,10 +911,17 @@ function parseQuotaAccount(raw, index) {
     provider, name, kind,
     plan: optionalString(obj.plan),
     user,
+    alias: optionalString(obj.alias),
+    seat: optionalString(obj.seat),
     balance: optionalString(obj.balance),
     error: optionalString(obj.error),
-    windows, pressure, worst,
+    icon: "",
+    until: optionalString(obj.until),
+    renew: optionalString(obj.renew),
+    asOf: optionalString(obj.asOf),
     readAt: optionalString(obj.readAt),
+    windows, pressure, worst,
+    lines: [],
   };
 }
 
@@ -790,11 +948,44 @@ function parseQuotaWindow(raw, account) {
     name,
     used: optionalFinite(obj.used),
     remaining,
-    unlimited,
-    display: optionalString(obj.display),
+    amount: optionalNumber(obj, "amount"),
+    limit: optionalNumber(obj, "limit"),
     unit: optionalString(obj.unit),
+    unlimited,
+    text: obj.text === true,
+    display: optionalString(obj.display),
     balance: optionalFinite(obj.balance),
+    spent: optionalFinite(obj.spent),
     resetsAt: optionalString(obj.resetsAt),
+    runsOutAt: optionalString(obj.runsOutAt),
+    runsOut: optionalNumber(obj, "runsOut"),
+    holds: parseHolds(obj.holds),
+    holdsWhy: optionalString(obj.holdsWhy),
+  };
+}
+
+/**
+ * A window's whole-window estimate, or null when the gateway left it out.
+ * A malformed holds object reads as null rather than a bad answer: the
+ * figure is an estimate the panel can do without.
+ *
+ * @param {unknown} raw
+ * @returns {QuotaHolds | null}
+ */
+function parseHolds(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const obj = /** @type {Record<string, unknown>} */ (raw);
+  const tokens = optionalFinite(obj.tokens);
+  if (tokens === null) return null;
+  const routed = typeof obj.routed === "object" && obj.routed !== null ? /** @type {Record<string, unknown>} */ (obj.routed) : {};
+  return {
+    tokens,
+    cost: optionalFinite(obj.cost) ?? 0,
+    priced: obj.priced === true,
+    used: optionalFinite(obj.used) ?? 0,
+    calls: optionalNumber(routed, "calls"),
+    routedTokens: optionalNumber(routed, "tokens"),
+    cacheRead: optionalNumber(routed, "cacheRead"),
   };
 }
 
@@ -854,24 +1045,310 @@ function formatInt(value) {
   return group(String(Math.round(value)));
 }
 
-/**
- * Format token counts with K, M, G, and T suffixes. One decimal below 100 of a
- * unit, no decimal above it, plain integers below 1,000.
- *
- * @param {number} value
- */
-function formatTokens(value) {
-  if (value < 1000) return String(Math.floor(value));
-  const units = ["K", "M", "G", "T"];
-  let scaled = value, unit = -1;
-  while (scaled >= 1000 && unit < units.length - 1) { scaled /= 1000; unit++; }
-  const number = scaled >= 99.95 ? String(Math.round(scaled)) : scaled.toFixed(1);
-  return `${number}${units[unit]}`;
-}
-
 /** Format grouped USD with exactly two decimals, such as "$509.40". @param {number} value */
 function formatCost(value) {
   return `$${group(value.toFixed(2))}`;
+}
+
+/**
+ * A cost as the Usage page's rows say it: at least two decimals, three under
+ * a dollar, a sub-mill amount to its first two digits, and a trailing + when
+ * some calls had no price. Nothing priced and nothing known is no figure,
+ * not $0.000.
+ *
+ * @param {number} value
+ * @param {number} unpriced
+ */
+function formatRowCost(value, unpriced) {
+  if (value === 0 && unpriced > 0) return "";
+  const digits = value >= 1 ? 2 : value > 0 && value < 1e-3 ? 1 - Math.floor(Math.log10(value)) : 3;
+  return `≈$${group(value.toFixed(digits))}${unpriced > 0 ? "+" : ""}`;
+}
+
+/**
+ * A token count as the page's tiles and rows say it: one decimal below ten
+ * of a unit, none above, B past a billion.
+ *
+ * @param {number} value
+ */
+function formatN(value) {
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
+  if (value >= 1e7) return `${Math.round(value / 1e6)}M`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+  if (value >= 1e5) return `${Math.round(value / 1e3)}K`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return String(Math.floor(value));
+}
+
+/**
+ * A window's own count, "576 / 28,000" with its unit, used or left as the
+ * toggle says; the vendor's display when there is no limit to count against.
+ *
+ * @param {QuotaWindow} window
+ * @param {boolean} left
+ */
+function quotaCount(window, left) {
+  if (!(window.limit > 0)) return window.display;
+  const n = left ? Math.max(0, window.limit - window.amount) : window.amount;
+  return `${group(String(n))} / ${group(String(window.limit))}${window.unit === "" ? "" : ` ${window.unit}`}`;
+}
+
+/**
+ * A window's figure: its count and share, the share alone, "Unlimited", a
+ * wallet's balance, or the vendor's own text.
+ *
+ * @param {QuotaWindow} window
+ * @param {boolean} left
+ */
+function quotaText(window, left) {
+  if (window.unlimited) return "Unlimited";
+  if (window.balance !== null) return `${group(String(window.balance))}${window.unit === "" ? "" : ` ${window.unit}`} left`;
+  if (window.text && window.used !== null && window.used >= 100) return "In use";
+  if (window.text || window.used === null || window.balance !== null) return window.display === "" ? "No allowance reported" : window.display;
+  const used = clamp100(window.used);
+  const n = left ? 100 - used : used;
+  const pct = `${Number.isInteger(n) ? n : n.toFixed(1)}% ${left ? "left" : "used"}`;
+  const count = quotaCount(window, left);
+  return count === "" ? pct : `${count} · ${pct}`;
+}
+
+/** @param {number} value */
+function clamp100(value) {
+  return Math.max(0, Math.min(100, value));
+}
+
+/**
+ * The fill's width: used, or what is left of it, as the toggle says.
+ *
+ * @param {QuotaWindow} window
+ * @param {boolean} left
+ */
+function quotaFill(window, left) {
+  if (window.used === null) return 0;
+  const used = Math.round(clamp100(window.used));
+  return left ? 100 - used : used;
+}
+
+/**
+ * A window's distance from an even pace through it, in points; null without
+ * a known start and reset. Over means more used than an even pace would have
+ * used by now.
+ *
+ * @param {QuotaWindow} window
+ * @param {number | null} start
+ * @param {boolean} left
+ * @param {number} now
+ * @returns {{n: number, over: boolean} | null}
+ */
+function quotaPace(window, start, left, now) {
+  if (window.unlimited || window.text || window.used === null || window.balance !== null) return null;
+  const reset = parseTime(window.resetsAt);
+  if (start === null || reset === null || !(reset > start) || now < start || now >= reset) return null;
+  const d = clamp100(window.used) - (100 * (now - start)) / (reset - start);
+  const n = Math.round(left ? -d : d);
+  return { n, over: Math.round(d) > 0 };
+}
+
+/** @param {number} n */
+function paceNumber(n) {
+  return `${n > 0 ? "+" : n < 0 ? "−" : "±"}${Math.abs(n)}%`;
+}
+
+/**
+ * "14:30", "tomorrow 09:00", "Thu 14:30", else "Oct 12 08:05", by hand
+ * because the runtime carries no Intl data.
+ *
+ * @param {number} at
+ * @param {number} now
+ */
+function resetClock(at, now) {
+  const d = new Date(at), n = new Date(now);
+  const time = formatTime(at);
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((day(d) - day(n)) / 864e5);
+  if (days <= 0) return time;
+  if (days === 1) return `tomorrow ${time}`;
+  if (days <= 6 - ((n.getDay() + 6) % 7)) return `${WEEKDAYS[d.getDay()]} ${time}`;
+  return `${MONTHS[d.getMonth()]} ${d.getDate()} ${time}`;
+}
+
+/** @param {number} at */
+function untilText(at) {
+  if (at <= Date.now()) return "Reset time passed";
+  const mins = Math.max(1, Math.round((at - Date.now()) / 60000));
+  if (mins < 60) return `in ${mins}m`;
+  const h = Math.round(mins / 60);
+  if (h < 48) return `in ${h}h`;
+  return `in ${Math.round(h / 24)}d`;
+}
+
+/**
+ * A plan's paid end: "Renews Aug 27", "Expires Dec 28", or "Until Nov 30"
+ * when the vendor doesn't say which.
+ *
+ * @param {QuotaAccount} account
+ */
+function planTerm(account) {
+  const at = parseTime(account.until);
+  if (at === null) return "";
+  const d = new Date(at);
+  const date = `${MONTHS[d.getMonth()]} ${d.getDate()}`;
+  return `${account.renew === "auto" ? "Renews" : account.renew === "off" ? "Expires" : "Until"} ${date}`;
+}
+
+/** @param {QuotaAccount} account */
+function planSpanText(account) {
+  return [account.plan, planTerm(account)].filter((part) => part !== "").join(" · ");
+}
+
+/**
+ * How long ago a reading was taken, "just now" under a minute.
+ *
+ * @param {number} at
+ */
+function agoText(at) {
+  const sec = Math.max(0, (Date.now() - at) / 1000);
+  for (const [unit, n] of /** @type {const} */ ([["year", 31536000], ["month", 2592000], ["week", 604800], ["day", 86400], ["hour", 3600], ["minute", 60]])) {
+    if (sec >= n) {
+      const v = Math.round(sec / n);
+      return `${v} ${unit}${v === 1 ? "" : "s"} ago`;
+    }
+  }
+  return "just now";
+}
+
+/**
+ * An ISO timestamp as epoch milliseconds, or null. The hand-split parse
+ * keeps nanosecond fractions and numeric zones working where Date.parse
+ * is unreliable in this runtime.
+ *
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function parseTime(value) {
+  if (typeof value !== "string" || value === "") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(value);
+  if (match === null) {
+    const at = Date.parse(value);
+    return Number.isFinite(at) ? at : null;
+  }
+  const [, year, month, day, hour, minute, second, zone] = match;
+  const utc = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), second === undefined ? 0 : Number(second));
+  if (zone === undefined) return utc - new Date(utc).getTimezoneOffset() * 60_000;
+  if (zone === "Z") return utc;
+  const sign = zone.startsWith("-") ? -1 : 1;
+  const digits = zone.slice(1).replace(":", "");
+  return utc - sign * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2))) * 60_000;
+}
+
+/**
+ * A curve's axis time: the clock on the same day, the date and clock
+ * otherwise, "Now" within a minute.
+ *
+ * @param {number} at
+ * @param {number} now
+ */
+function curveTimeText(at, now) {
+  if (Math.abs(at - now) < 60e3) return "Now";
+  const d = new Date(at), n = new Date(now);
+  const time = formatTime(at);
+  if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return time;
+  return `${MONTHS[d.getMonth()]} ${d.getDate()} ${time}`;
+}
+
+/**
+ * The current cycle of one window's line: its start from the newest
+ * reading, its reset from the window itself, shifted along when the window
+ * has rolled since that reading.
+ *
+ * @param {QuotaLine} line
+ * @param {QuotaWindow} window
+ * @param {number} now
+ * @returns {{start: number, reset: number | null}}
+ */
+function windowCycle(line, window, now) {
+  const last = line.points[line.points.length - 1];
+  let reset = parseTime(window.resetsAt) ?? last.reset;
+  let start = last.start;
+  if (start !== null && last.reset !== null && reset !== null) start += reset - last.reset;
+  if (start === null) start = last.at;
+  if (reset !== null && reset <= now) reset = null;
+  return { start: Math.min(start, now), reset };
+}
+
+/**
+ * The readings since the last refill, fitted to a line and carried to zero:
+ * when the window empties at this pace, and whether that is past its reset.
+ * Null with under three readings, an hour of them, or nothing left.
+ *
+ * @param {{at: number, left: number}[]} points
+ * @param {number} start
+ * @param {number | null} reset
+ * @param {number} now
+ * @returns {{out: number | null, lasts: boolean} | null}
+ */
+function curveEta(points, start, reset, now) {
+  if (reset !== null && reset <= now) return null;
+  const cycle = points.filter((p) => p.at >= start && p.at <= now);
+  let i = cycle.length - 1;
+  while (i > 0 && cycle[i - 1].left >= cycle[i].left && now - cycle[i - 1].at <= 7 * 86400e3) i--;
+  const pts = cycle.slice(i);
+  const last = pts[pts.length - 1];
+  if (pts.length < 3 || !last || !(last.left > 0) || last.at - pts[0].at < 3600e3) return null;
+  const t0 = pts[0].at, n = pts.length;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const p of pts) { const x = (p.at - t0) / 86400e3; sx += x; sy += p.left; sxx += x * x; sxy += x * p.left; }
+  const den = n * sxx - sx * sx;
+  if (!(den > 0)) return null;
+  const slope = (n * sxy - sx * sy) / den;
+  if (!(slope < 0)) return reset !== null ? { out: null, lasts: true } : null;
+  const out = t0 + (-(sy - slope * sx) / n / slope) * 86400e3;
+  if (!(out > now)) return null;
+  return { out, lasts: reset !== null && out >= reset };
+}
+
+/**
+ * The page's own palette for the content area, light and dark as app.css
+ * draws them. The header and period row keep Herdr's theme tokens; only the
+ * content below them is the page's. Herdr's theme() carries colors alone,
+ * so the theme's own background decides which pair to draw.
+ */
+function pagePalette() {
+  const bg = theme().background ?? "#FFFFFF";
+  const r = parseInt(bg.slice(1, 3), 16), g = parseInt(bg.slice(3, 5), 16), b = parseInt(bg.slice(5, 7), 16);
+  const dark = (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128;
+  return dark ? {
+    bg: "#1A1A1E", card: "#232327", card2: "#1F1F23", pill: "#2D2D33",
+    line: "#333339", line2: "#2C2C32",
+    fg: "#EDEDF1", fg2: "#B9B9C1", muted: "#8B8B94", faint: "#56565F",
+    accent: "#A5B4FC", green: "#6FD99B", amber: "#F2B544", red: "#F28B82",
+    series: ["#A5B4FC", "#7DD3FC", "#6EE7B7", "#FCD34D", "#F9A8D4", "#C4B5FD", "#94A3B8"],
+  } : {
+    bg: "#F6F6F8", card: "#FFFFFF", card2: "#F9F9FB", pill: "#F1F1F4",
+    line: "#E3E3E8", line2: "#ECECF0",
+    fg: "#1C1C21", fg2: "#4B4B53", muted: "#85858D", faint: "#B9B9C2",
+    accent: "#5B5BD6", green: "#1A7F37", amber: "#B45309", red: "#D64545",
+    series: ["#5B5BD6", "#0EA5E9", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6", "#64748B"],
+  };
+}
+
+/**
+ * The five provider icons the panel ships; anything else, including the
+ * gateway's own picture files, falls back to magpie's.
+ *
+ * @param {string} name
+ */
+function iconFile(name) {
+  return ICON_FILES[name] ?? "magpie.svg";
+}
+
+/**
+ * @param {string} name
+ * @param {number} size
+ * @param {{fg: string}} p
+ */
+function providerIcon(name, size, p) {
+  return image(`mods/magpie-stats/${iconFile(name)}`).w(size).h(size).flex_none().text_color(p.fg);
 }
 
 /**
@@ -902,74 +1379,78 @@ function formatTime(receivedAt) {
 }
 
 /**
- * Date.parse is unreliable for nanosecond fractions here, so split the
- * fields by hand.
+ * Group a provider's accounts into one card when every one of them has a
+ * user, as the page does; an account without one keeps its own card.
  *
- * @param {string} text
+ * @param {QuotaAccount[]} accounts
+ * @returns {QuotaAccount[][]}
  */
-function formatIsoTime(text) {
-  if (text === "") return "";
-  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(text);
-  if (match === null) return text;
-  const [, year, month, day, hour, minute, second, zone] = match;
-  if (zone === undefined) return `${hour}:${minute}`;
-  let offset = 0;
-  if (zone !== "Z") {
-    const sign = zone.startsWith("-") ? -1 : 1;
-    const digits = zone.slice(1).replace(":", "");
-    offset = sign * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2)));
+function groupAccounts(accounts) {
+  const groups = [];
+  for (const account of accounts) {
+    const g = account.user !== "" && groups.find((x) => x[0].user !== "" && x[0].provider === account.provider);
+    if (g) g.push(account); else groups.push([account]);
   }
-  const utc = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), second === undefined ? 0 : Number(second));
-  return formatTime(utc - offset * 60_000);
+  return groups;
 }
 
-/** @param {number} value */
-function formatQuotaPercent(value) {
-  const fixed = value.toFixed(1);
-  return `${fixed.endsWith(".0") ? fixed.slice(0, -2) : fixed}%`;
-}
-
-/** @param {QuotaAccount} account */
-function quotaValue(account) {
-  return account.pressure === null ? "unlimited" : formatQuotaPercent(account.pressure);
-}
-
-/** @param {QuotaAccount[]} accounts */
-function limitedAccounts(accounts) {
-  return accounts
-    .filter((account) => account.error === "" && account.pressure !== null)
-    .sort((a, b) => (a.pressure ?? 0) - (b.pressure ?? 0));
-}
-
-/** @param {QuotaAccount[]} accounts */
-function unlimitedAccounts(accounts) {
-  return accounts.filter((account) => account.error === "" && account.pressure === null && account.windows.length > 0);
-}
-
-/** @param {QuotaAccount[]} accounts */
-function balanceAccounts(accounts) {
-  return accounts.filter((account) => account.error === "" && account.windows.length === 0 && account.balance !== "");
-}
-
-/** @param {QuotaAccount} account */
-function quotaTooltip(account) {
-  const lines = [account.name];
-  if (account.plan !== "") lines.push(`Plan ${account.plan}`);
-  if (account.user !== "") lines.push(`User ${account.user}`);
-  for (const window of account.windows) {
-    const amount = window.display !== ""
-      ? window.display
-      : window.unlimited
-        ? "unlimited"
-        : window.remaining !== null
-          ? formatQuotaPercent(window.remaining)
-          : "";
-    const reset = window.resetsAt !== "" ? ` · resets ${formatIsoTime(window.resetsAt)}` : "";
-    lines.push(amount === "" ? `${window.name}${reset}` : `${window.name} · ${amount}${reset}`);
+/**
+ * A card's height before it has been measured: enough to place it in a
+ * column on the first frame; the measurement replaces it at once.
+ *
+ * @param {QuotaAccount[]} group
+ * @param {boolean} left
+ */
+function estimateCardHeight(group, left) {
+  let h = 42;
+  for (const account of group) {
+    if (account.user !== "" || account.alias !== "") h += 20;
+    if (account.error !== "") { h += 34; continue; }
+    if (account.windows.length === 0) { h += account.balance === "" ? 8 : 46; continue; }
+    const rows = Math.ceil(account.windows.length / 2);
+    h += rows * 74 + (rows - 1) * 9;
+    if (account.lines.some((l) => l.points.length > 0)) h += 118;
+    if (account.balance !== "") h += 46;
+    h += 18;
   }
-  if (account.readAt !== "") lines.push(`Read at ${formatIsoTime(account.readAt)}`);
-  if (account.error !== "") lines.push(account.error);
-  return lines.join("\n");
+  if (group.length > 1) h += 78;
+  return h;
+}
+
+/**
+ * One provider's accounts as one figure a window: counted windows add their
+ * amounts and limits, a share is averaged over accounts on one plan, and
+ * only windows two or more accounts share go in. A failed reading is
+ * unknown, never zero.
+ *
+ * @param {QuotaAccount[]} accounts
+ * @returns {{name: string, amount: number, limit: number, unit: string, used: number, accounts: number}[]}
+ */
+function aggregateWindows(accounts) {
+  const read = accounts.filter((a) => a.error === "" && a.windows.length > 0);
+  const by = new Map();
+  for (const account of read) {
+    for (const window of account.windows) {
+      if (window.text || window.unlimited || window.used === null || window.balance !== null) continue;
+      const kind = window.limit > 0 ? "count" : `share:${account.plan}`;
+      const key = `${window.name}\n${window.unit}\n${kind}`;
+      let m = by.get(key);
+      if (!m) by.set(key, (m = { name: window.name, unit: window.unit, kind, n: 0, amount: 0, limit: 0, used: 0 }));
+      m.n++;
+      if (kind === "count") { m.amount += window.amount; m.limit += window.limit; }
+      else m.used += clamp100(window.used);
+    }
+  }
+  const out = [];
+  for (const m of by.values()) {
+    if (m.n < 2) continue;
+    out.push({
+      name: m.name, unit: m.unit, accounts: m.n,
+      amount: m.amount, limit: m.limit,
+      used: m.kind === "count" ? (100 * m.amount) / m.limit : Math.round((10 * m.used) / m.n) / 10,
+    });
+  }
+  return out;
 }
 
 export default class MagpieStats extends View {
@@ -1012,11 +1493,46 @@ export default class MagpieStats extends View {
     /** @type {number} */
     this.width = 240;
 
+    /** @type {boolean} */
+    this.quotaLeft = localStorage.getItem(QUOTA_LEFT_KEY) === "1";
+
+    /** @type {Set<string>} */
+    this.folded = new Set();
+    try {
+      const stored = JSON.parse(localStorage.getItem(FOLDED_KEY) ?? "[]");
+      if (Array.isArray(stored)) this.folded = new Set(stored.filter((x) => typeof x === "string"));
+    } catch { /* a junk stored value folds nothing */ }
+
+    /** @type {Map<string, number>} */
+    this.cardHeights = new Map();
+    this.cardPackSignature = "";
+
     const stored = localStorage.getItem(SELECTED_INSTANCE_KEY);
     if (stored !== null) this.selectedInstanceId = /** @type {InstanceId} */ (stored);
 
     this.tick(cx);
     cx.timer.every(REFRESH_MS, (cx) => this.tick(cx));
+  }
+
+  /**
+   * Flip every window between used and left, kept across a restart.
+   */
+  setQuotaLeft(left, cx) {
+    if (left === this.quotaLeft) return;
+    this.quotaLeft = left;
+    localStorage.setItem(QUOTA_LEFT_KEY, left ? "1" : "0");
+    cx.notify();
+  }
+
+  /**
+   * Fold or unfold one list, kept across a restart by its name.
+   *
+   * @param {string} name
+   */
+  toggleFold(name, cx) {
+    if (this.folded.has(name)) this.folded.delete(name); else this.folded.add(name);
+    localStorage.setItem(FOLDED_KEY, JSON.stringify([...this.folded]));
+    cx.notify();
   }
 
   /** The default instance plus every additional one, the default first. */
@@ -1551,60 +2067,62 @@ export default class MagpieStats extends View {
    * @param {"narrow" | "medium" | "wide"} tier
    */
   renderBody(state, quota, tier, t) {
+    const p = pagePalette();
     if (state.kind === "loading") {
-      return div().flex_1().min_h(0).px(10).pt(8).text_color(t.dim).child("Reading Magpie usage…");
+      return div().flex_1().min_h(0).w_full().bg(p.bg).px(10).pt(8).text_color(p.muted).child("Reading Magpie usage…");
     }
     if (state.kind === "unavailable") {
       const copy = problemCopy(state.problem);
-      return v_flex().flex_1().min_h(0).px(10).pt(10).gap(4)
-        .child(div().font_medium().text_color(t.foreground).child(copy.title))
-        .child(div().text_size(11).text_color(t.dim).tooltip(state.problem.detail).child(copy.body));
+      return v_flex().flex_1().min_h(0).w_full().bg(p.bg).px(10).pt(10).gap(4)
+        .child(div().font_medium().text_color(p.fg).child(copy.title))
+        .child(div().text_size(11).text_color(p.muted).tooltip(state.problem.detail).child(copy.body));
     }
     const content = this.renderSnapshot(state.snapshot, quota, tier);
     if (state.kind !== "stale") return content;
-    return v_flex().flex_1().min_h(0)
+    return v_flex().flex_1().min_h(0).w_full().bg(p.bg)
       .child(content)
-      .child(h_flex().flex_none().px(10).py(4).text_size(11).text_color(t.dim)
+      .child(h_flex().flex_none().px(10).py(4).text_size(11).text_color(p.muted)
         .tooltip(problemCopy(state.problem).body)
         .child(`Can't refresh · updated ${formatTime(state.snapshot.receivedAt)}`));
   }
 
   /**
-   * The Overview: cost, tiles, chart and the four lists. Wide splits it into
-   * two columns; narrow and medium keep one, in the page's order.
+   * The Overview in the page's order: allowances, the scope note, tiles,
+   * chart, the four lists, the footer note. Wide splits it into two columns;
+   * narrow and medium keep one. The content area is the page's own palette;
+   * the header and period row above keep Herdr's.
    *
    * @param {UsagePageSnapshot} snapshot
    * @param {QuotaState} quota
    * @param {"narrow" | "medium" | "wide"} tier
    */
   renderSnapshot(snapshot, quota, tier) {
-    const cost = this.renderCost(snapshot.totals);
-    const kpis = this.renderKpis(snapshot.totals, tier);
-    const chart = this.renderChart(snapshot.chart, tier);
-    const allowances = this.renderAllowances(quota, tier);
-    const scroll = v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll().items_center();
+    const p = pagePalette();
+    const cost = this.renderCost(snapshot.totals, p);
+    const allowances = this.renderAllowances(quota, tier, p);
+    const scope = div().flex_none().px(10).pt(8).text_size(11).text_color(p.faint)
+      .child("Gateway calls only; session-log calls are in Requests. Local rejections are excluded from totals.");
+    const kpis = this.renderKpis(snapshot.totals, tier, p);
+    const chart = this.renderChart(snapshot.chart, tier, p);
+    const footer = div().flex_none().px(10).pt(10).pb(6).text_size(11).text_color(p.faint).whitespace_normal()
+      .child(`Counted from the providers' own usage reports on every call through the gateway · ${snapshot.path === "" ? "~/.config/magpie/usage.jsonl" : snapshot.path}`);
+    const scroll = v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll().items_center().bg(p.bg);
 
+    const lists = (names) => names.map(([title, slug, rows]) => this.renderRows(title, slug, rows, tier, p));
     if (tier === "wide") {
-      const left = [cost, kpis, chart];
-      if (snapshot.agents.length > 0) left.push(this.renderRows("Agents", "agents", snapshot.agents, tier));
-      const right = [];
-      if (allowances !== null) right.push(allowances);
-      if (snapshot.models.length > 0) right.push(this.renderRows("Models", "models", snapshot.models, tier));
-      if (snapshot.accounts.length > 0) right.push(this.renderRows("Accounts", "accounts", snapshot.accounts, tier));
-      if (snapshot.keys.length > 0) right.push(this.renderRows("Gateway keys", "gateway-keys", snapshot.keys, tier));
+      const left = [cost, allowances, scope, kpis, chart,
+        ...lists([["Agents", "agents", snapshot.agents]])];
+      const right = lists([["Models", "models", snapshot.models], ["Accounts", "accounts", snapshot.accounts], ["Gateway keys", "gateway-keys", snapshot.keys]]);
+      right.push(footer);
       return scroll.child(h_flex().flex_none().w_full().max_w(CONTENT_WIDTH).gap(COLUMN_GAP).items_start()
-        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(left))
-        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(right)));
+        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(left.filter((x) => x !== null)))
+        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(right.filter((x) => x !== null))));
     }
 
-    const sections = [cost];
-    if (allowances !== null) sections.push(allowances);
-    sections.push(kpis, chart);
-    if (snapshot.agents.length > 0) sections.push(this.renderRows("Agents", "agents", snapshot.agents, tier));
-    if (snapshot.models.length > 0) sections.push(this.renderRows("Models", "models", snapshot.models, tier));
-    if (snapshot.accounts.length > 0) sections.push(this.renderRows("Accounts", "accounts", snapshot.accounts, tier));
-    if (snapshot.keys.length > 0) sections.push(this.renderRows("Gateway keys", "gateway-keys", snapshot.keys, tier));
-    return scroll.child(v_flex().flex_none().w_full().max_w(COLUMN_WIDTH).children(sections));
+    const sections = [cost, allowances, scope, kpis, chart,
+      ...lists([["Agents", "agents", snapshot.agents], ["Models", "models", snapshot.models], ["Accounts", "accounts", snapshot.accounts], ["Gateway keys", "gateway-keys", snapshot.keys]]),
+      footer];
+    return scroll.child(v_flex().flex_none().w_full().max_w(COLUMN_WIDTH).children(sections.filter((x) => x !== null)));
   }
 
   /**
@@ -1612,9 +2130,9 @@ export default class MagpieStats extends View {
    * it, so a total never reads as if those cost nothing.
    *
    * @param {Totals} totals
+   * @param {*} p
    */
-  renderCost(totals) {
-    const t = theme();
+  renderCost(totals, p) {
     const unpriced = totals.unpriced;
     const note = unpriced > 0
       ? `${formatInt(unpriced)} ${unpriced === 1 ? "call" : "calls"} unpriced`
@@ -1623,47 +2141,48 @@ export default class MagpieStats extends View {
       ? `${formatInt(unpriced)} ${unpriced === 1 ? "call had" : "calls had"} no known price and ${unpriced === 1 ? "is" : "are"} not counted`
       : "Estimated at effective model prices. A model's price at one provider is set in that provider's Model settings and counts over its list price";
     return h_flex().id("magpie-cost").flex_none().px(10).pt(6).gap(6).items_end().flex_wrap()
-      .child(div().text_size(17).font_semibold().child(`≈${formatCost(totals.cost)}`))
-      .child(div().text_size(11).pb(1).text_color(t.dim).tooltip(tooltip).child(note));
+      .child(div().text_size(15).font_semibold().text_color(p.fg).child(formatRowCost(totals.cost, unpriced)))
+      .child(div().text_size(12).pb(1).text_color(p.muted).tooltip(tooltip).child(note));
   }
 
   /**
-   * Four tiles: tokens, cache read, reasoning, calls. Narrow stacks them two
-   * by two; medium and wide keep one row.
+   * Four tiles: tokens, cache read, reasoning, calls. White cells with 1px
+   * gaps inside a 12px rounded bordered strip; narrow stacks them two by two.
    *
    * @param {Totals} totals
    * @param {"narrow" | "medium" | "wide"} tier
+   * @param {*} p
    */
-  renderKpis(totals, tier) {
-    const t = theme();
+  renderKpis(totals, tier, p) {
     const tokens = totals.input + totals.output;
     const prompt = tokens + totals.cacheRead + totals.cacheWrite;
     const hit = totals.cacheRead > 0 && prompt > 0 ? totals.cacheRead / prompt : null;
     const failed = [
+      totals.credited > 0 ? `${formatN(totals.credits)} credits` : "",
       totals.errors > 0 ? `${formatInt(totals.errors)} failed` : "",
-      totals.retried > 0 ? `${formatInt(totals.retried)} retried` : "",
+      totals.retried > 0 ? `${formatInt(totals.retried)} answered on a retry` : "",
       totals.canceled > 0 ? `${formatInt(totals.canceled)} canceled` : "",
-      totals.unpriced > 0 ? `${formatInt(totals.unpriced)} unpriced` : "",
+      totals.unpriced > 0 ? `${formatInt(totals.unpriced)} ${totals.unpriced === 1 ? "call" : "calls"} unpriced` : "",
     ].filter(Boolean).join(" · ");
     const cacheTooltip = [
-      `Cache written ${formatTokens(totals.cacheWrite)} (${formatInt(totals.cacheWrite)})`,
-      `Reasoning ${formatTokens(totals.reasoning)} (${formatInt(totals.reasoning)})`,
+      `Cache written ${formatN(totals.cacheWrite)} (${formatInt(totals.cacheWrite)})`,
+      `Reasoning ${formatN(totals.reasoning)} (${formatInt(totals.reasoning)})`,
     ].join("\n");
     const unpricedTooltip = totals.unpriced > 0
       ? `${formatInt(totals.unpriced)} ${totals.unpriced === 1 ? "call had" : "calls had"} no known price and ${totals.unpriced === 1 ? "is" : "are"} not counted`
       : "";
-    const tile = (id, value, label, sub, tooltip) => v_flex().id(id).flex_1().min_w(0).p(8).gap(1).bg(t.raised)
+    const tile = (id, value, label, sub, tooltip) => v_flex().id(id).flex_1().min_w(0).px(14).pt(12).pb(11).bg(p.card)
       .when(tooltip !== "", (e) => e.tooltip(tooltip))
-      .child(div().text_size(16).font_semibold().truncate().child(value))
-      .child(div().text_size(10).text_color(t.muted).child(label))
-      .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.dim).whitespace_normal().child(sub)));
+      .child(div().text_size(20).font_semibold().text_color(p.fg).truncate().child(value))
+      .child(div().pt(3).text_size(11).font_semibold().text_color(p.muted).child(label))
+      .when(sub !== "", (e) => e.child(div().pt(3).text_size(11).text_color(p.muted).truncate().child(sub)));
     const tiles = [
-      tile("magpie-kpi-tokens", formatTokens(tokens), "tokens", `${formatTokens(totals.input)} in · ${formatTokens(totals.output)} out`, ""),
-      tile("magpie-kpi-cache", formatTokens(totals.cacheRead), "cache read", hit === null ? "" : `hit rate ${formatPercent(hit)}`, cacheTooltip),
-      tile("magpie-kpi-reasoning", formatTokens(totals.reasoning), "reasoning", "inside output", ""),
-      tile("magpie-kpi-calls", formatInt(totals.calls), "calls", failed, unpricedTooltip),
+      tile("magpie-kpi-tokens", formatN(tokens), "TOKENS", `${formatN(totals.input)} in · ${formatN(totals.output)} out`, ""),
+      tile("magpie-kpi-cache", formatN(totals.cacheRead), "CACHE READ", hit === null ? "" : `hit rate ${formatPercent(hit)}`, cacheTooltip),
+      tile("magpie-kpi-reasoning", formatN(totals.reasoning), "REASONING", "inside output", ""),
+      tile("magpie-kpi-calls", formatInt(totals.calls), totals.calls === 1 ? "CALL" : "CALLS", failed, unpricedTooltip),
     ];
-    const grid = v_flex().flex_none().w_full().gap(1).bg(t.border).border_1().border_color(t.border).rounded(8).overflow_hidden();
+    const grid = v_flex().flex_none().w_full().gap(1).bg(p.line).border_1().border_color(p.line).rounded(12).overflow_hidden();
     if (tier === "narrow") {
       return v_flex().flex_none().px(10).pt(8)
         .child(grid.child(h_flex().gap(1).children(tiles.slice(0, 2))).child(h_flex().gap(1).children(tiles.slice(2))));
@@ -1672,223 +2191,466 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * The chart: input stacked under output, scaled by tokens. The height
-   * follows the tier; a nonzero bar is at least 2px. No SVG, canvas, or
-   * animation timer.
+   * The chart: input stacked under output, scaled by tokens, in a white 12px
+   * card. The height follows the tier; a nonzero bar is at least 2px. No SVG,
+   * canvas, or animation timer.
    *
    * @param {Chart} chart
    * @param {"narrow" | "medium" | "wide"} tier
+   * @param {*} p
    */
-  renderChart(chart, tier) {
-    const t = theme();
+  renderChart(chart, tier, p) {
     const height = tier === "narrow" ? 32 : tier === "medium" ? 56 : 72;
     const peak = chart.points.reduce((max, point) => Math.max(max, point.input + point.output), 0);
-    const every = chart.points.length <= 8 ? 1 : Math.ceil(chart.points.length / 6);
+    const every = chart.points.length <= 8 ? 1 : chart.points.length <= 31 ? Math.ceil(chart.points.length / 6) : Math.ceil(chart.points.length / 5);
     const empty = chart.points.length === 0 || peak === 0;
-    const bars = h_flex().id("magpie-chart").w_full().h(height).items_end().gap(1)
-      .when(empty, (e) => e.items_center().justify_center().text_size(11).text_color(t.dim).child("No calls in this period"))
+    const bars = h_flex().id("magpie-chart").w_full().h(height).items_end().gap(3).border_b_1().border_color(p.line2)
+      .when(empty, (e) => e.items_center().justify_center().text_size(11).text_color(p.muted).child("No calls in this period"))
       .when(!empty, (e) => e.children(chart.points.map((point) => {
         const tokens = point.input + point.output;
         const barHeight = tokens <= 0 ? 0 : Math.max(2, Math.round((tokens / peak) * height));
         const outputHeight = tokens <= 0 ? 0 : Math.round((point.output / tokens) * barHeight);
         const inputHeight = barHeight - outputHeight;
         return div().id(`magpie-bar-${point.key}`).flex_1().min_w(0).h(height).flex().items_end()
-          .when(barHeight > 0, (e) => e.child(v_flex().w_full().h(barHeight).flex_none().rounded(1).overflow_hidden()
-            .when(outputHeight > 0, (x) => x.child(div().w_full().h(outputHeight).flex_none().bg(t.accent)))
-            .when(inputHeight > 0, (x) => x.child(div().w_full().h(inputHeight).flex_none().bg(t.accent).opacity(0.38)))))
+          .when(barHeight > 0, (e) => e.child(v_flex().w_full().h(barHeight).flex_none().rounded_tl(3).rounded_tr(3).overflow_hidden()
+            .when(outputHeight > 0, (x) => x.child(div().w_full().h(outputHeight).flex_none().bg(p.accent)))
+            .when(inputHeight > 0, (x) => x.child(div().w_full().h(inputHeight).flex_none().bg(p.accent).opacity(0.38)))))
           .tooltip(pointTooltip(point, chart.bucket));
       })));
     return v_flex().flex_none().px(10).pt(8)
-      .child(v_flex().flex_none().w_full().gap(3).p(8).rounded(8).border_1().border_color(t.border).bg(t.raised)
-        .when(!empty, (e) => e.child(h_flex().w_full().items_end().justify_end()
-          .child(div().text_size(10).text_color(t.dim).child(formatTokens(peak)))))
+      .child(v_flex().flex_none().w_full().px(14).pt(12).pb(8).rounded(12).border_1().border_color(p.line).bg(p.card)
+        .when(!empty, (e) => e.child(h_flex().w_full().pb(5).items_end().justify_end()
+          .child(div().text_size(10.5).text_color(p.faint).child(formatN(peak)))))
         .child(bars)
-        .when(!empty, (e) => e.child(h_flex().w_full().gap(1)
-          .children(chart.points.map((point, i) => div().flex_1().min_w(0).text_size(9).text_color(t.dim)
+        .when(!empty, (e) => e.child(h_flex().w_full().pt(5).gap(3)
+          .children(chart.points.map((point, i) => div().flex_1().min_w(0).text_size(10.5).text_color(p.muted)
             .whitespace_nowrap().child(i % every === 0 ? point.label : "")))))
-        .when(chart.truncated, (e) => e.child(div().text_size(10).text_color(t.dim)
+        .when(chart.truncated, (e) => e.child(div().text_size(10).text_color(p.muted)
           .child(`Calls by ${chart.bucket} · last ${CHART_LIMIT}`))));
   }
 
   /**
-   * The allowances: a card per account, two per row, at medium and wide; the
-   * compact rows in narrow. Loading and an empty payload draw nothing, and a
-   * refused account keeps its one line.
+   * The allowances: grouped cards, floor(width/268) per row at medium and
+   * wide; one full-width card per group in narrow. Loading and an empty
+   * payload draw nothing. The head carries the Used/Left toggle.
    *
    * @param {QuotaState} quota
    * @param {"narrow" | "medium" | "wide"} tier
+   * @param {*} p
    */
-  renderAllowances(quota, tier) {
-    const t = theme();
+  renderAllowances(quota, tier, p) {
     if (quota.kind === "loading") return null;
     if (quota.kind === "unavailable") {
-      return div().px(10).pt(8).text_size(11).text_color(t.dim)
+      return div().px(10).pt(8).text_size(11).text_color(p.muted)
         .tooltip(problemCopy(quota.problem).body)
         .child("Quota unavailable");
     }
     const accounts = quota.snapshot.accounts;
     if (accounts.length === 0) return null;
-    const title = div().pb(2).text_size(11).font_medium().text_color(t.dim)
-      .when(quota.kind === "stale", (e) => e.tooltip(problemCopy(quota.problem).body))
-      .child(quota.kind === "stale" ? "Allowances · stale" : "Allowances");
-    if (tier === "narrow") {
-      return v_flex().flex_none().px(10).pt(8).child(title).children(this.renderQuotaRows(accounts));
+    const groups = groupAccounts(accounts);
+    const hasWindows = accounts.some((a) => a.error === "" && a.windows.length > 0);
+    const head = h_flex().flex_none().w_full().px(10).pt(8).pb(6).gap(6).items_center()
+      .child(div().text_size(11).font_semibold().text_color(p.muted)
+        .when(quota.kind === "stale", (e) => e.tooltip(problemCopy(quota.problem).body))
+        .child(quota.kind === "stale" ? "ALLOWANCES · STALE" : "ALLOWANCES"))
+      .child(div().flex_1())
+      .when(hasWindows, (e) => e.child(this.renderQuotaMode(p)));
+    const cols = tier === "narrow" ? 1 : Math.max(1, Math.floor((Math.min(this.width, COLUMN_WIDTH) - 20 + 7) / (260 + 7)));
+    const cards = groups.map((group) => this.renderQuotaCard(group, p));
+    if (cols === 1) {
+      return v_flex().flex_none().w_full()
+        .child(head)
+        .child(v_flex().flex_none().w_full().px(10).gap(7).children(cards));
     }
-    const cards = accounts.filter((account) => account.error === "");
-    const errored = accounts.filter((account) => account.error !== "");
-    const rows = [];
-    for (let i = 0; i < cards.length; i += 2) {
-      rows.push(h_flex().flex_none().w_full().gap(8).items_start()
-        .child(this.renderQuotaCard(cards[i]))
-        .child(i + 1 < cards.length ? this.renderQuotaCard(cards[i + 1]) : div().flex_1()));
+    // Masonry, as the page packs its cards: each card measured once at this
+    // column width, then placed in the shortest column. The estimate stands
+    // in until a card's first measurement.
+    const inner = Math.min(this.width, COLUMN_WIDTH) - 20;
+    const cardWidth = (inner - (cols - 1) * 7) / cols;
+    const signature = `${cols}|${Math.round(cardWidth)}|${this.quotaLeft ? 1 : 0}`;
+    if (this.cardPackSignature !== signature) {
+      this.cardPackSignature = signature;
+      this.cardHeights = new Map();
     }
-    return v_flex().flex_none().px(10).pt(8)
-      .child(title)
-      .when(rows.length > 0, (e) => e.child(v_flex().flex_none().w_full().gap(8).children(rows)))
-      .when(errored.length > 0, (e) => e.child(this.renderQuotaErrors(errored)));
-  }
-
-  /** @param {QuotaAccount} account */
-  renderQuotaCard(account) {
-    const t = theme();
-    const head = [account.plan, account.user].filter((part) => part !== "").join(" · ");
-    return v_flex().id(`magpie-quota-card-${account.id}`).flex_1().min_w(0).gap(3).p(8)
-      .rounded(8).border_1().border_color(t.border).bg(t.raised)
-      .tooltip(quotaTooltip(account))
-      .child(div().font_medium().truncate().text_color(t.foreground).child(account.name))
-      .when(head !== "", (e) => e.child(div().text_size(10).text_color(t.dim).truncate().child(head)))
-      .children(account.windows.map((window) => this.renderQuotaWindowLine(window)))
-      .when(account.balance !== "", (e) => e.child(div().text_size(10).text_color(t.muted).child(account.balance)));
-  }
-
-  /** @param {QuotaWindow} window */
-  renderQuotaWindowLine(window) {
-    const t = theme();
-    const remaining = window.unlimited || window.remaining === null ? 100 : window.remaining;
-    const color = window.unlimited || window.remaining === null ? t.muted
-      : window.remaining < 10 ? t.blocked
-      : window.remaining < 30 ? t.idle
-      : t.muted;
-    const reset = window.resetsAt === "" ? "" : `resets ${formatIsoTime(window.resetsAt)}`;
-    return v_flex().flex_none().w_full().gap(2).pb(2)
-      .child(h_flex().w_full().gap(6).items_center()
-        .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(t.muted).child(window.name))
-        .child(div().flex_none().text_size(10).text_color(color)
-          .child(window.unlimited ? "unlimited" : formatQuotaPercent(remaining)))
-        .when(reset !== "", (e) => e.child(div().flex_none().text_size(9).text_color(t.dim).child(reset))))
-      .child(div().h(3).w_full().rounded(2).bg(t.hover).overflow_hidden()
-        .child(div().h_full().rounded(2).bg(t.accent).opacity(0.7)
-          .w(`${Math.max(1.5, Math.min(100, remaining)).toFixed(1)}%`)));
-  }
-
-  /**
-   * The compact rows narrow keeps: the accounts nearest their limit, the
-   * unlimited ones, then balances and any refused account.
-   *
-   * @param {QuotaAccount[]} accounts
-   */
-  renderQuotaRows(accounts) {
-    const t = theme();
-    const limited = limitedAccounts(accounts);
-    const unlimited = unlimitedAccounts(accounts);
-    const balances = balanceAccounts(accounts);
-    const errored = accounts.filter((account) => account.error !== "");
-    const rows = [...limited, ...unlimited].slice(0, QUOTA_LIMIT);
-    const hidden = limited.length + unlimited.length - rows.length;
-    const lines = rows.map((account) => {
-      const color = account.pressure === null ? t.muted
-        : account.pressure < 10 ? t.blocked
-        : account.pressure < 30 ? t.idle
-        : t.muted;
-      return h_flex().id(`magpie-quota-${account.id}`).h(18).gap(6).items_center()
-        .tooltip(quotaTooltip(account))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(account.name))
-        .child(div().flex_none().text_size(11).text_color(color).child(quotaValue(account)));
+    const heights = this.cardHeights ?? new Map();
+    const ends = Array(cols).fill(0);
+    const placed = [];
+    let tall = 0;
+    groups.forEach((group, i) => {
+      const key = group[0].id;
+      const h = heights.get(key) ?? estimateCardHeight(group, this.quotaLeft);
+      let c = 0;
+      for (let k = 1; k < cols; k++) if (ends[k] < ends[c]) c = k;
+      const top = ends[c];
+      ends[c] += h + 7;
+      tall = Math.max(tall, ends[c] - 7);
+      placed.push(div().absolute().top(top).left(`${(c * (100 / cols)).toFixed(3)}%`).w(`${(100 / cols).toFixed(3)}%`)
+        .px(c === 0 ? 0 : 3.5).pr(c === cols - 1 ? 0 : 3.5)
+        .child(cards[i]
+          .id(`magpie-card-measure-${key}`)
+          .on_size_change((size, cx) => {
+            if (size.height > 0 && heights.get(key) !== size.height) {
+              heights.set(key, size.height);
+              this.cardHeights = heights;
+              cx.notify();
+            }
+          })));
     });
-    if (hidden > 0) {
-      lines.push(div().text_size(11).text_color(t.dim).child(`+ ${hidden} more`));
-    }
-    if (balances.length > 0) {
-      lines.push(h_flex().id("magpie-quota-balances").h(18).gap(6).items_center().text_size(11)
-        .tooltip(balances.map((account) => `${account.name}${account.user === "" ? "" : ` · ${account.user}`}: ${account.balance}`).join("\n"))
-        .child(div().flex_none().text_color(t.dim).child("Balance"))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.muted)
-          .child(balances.map((account) => account.user === "" ? account.balance : `${account.user} ${account.balance}`).join(" · "))));
-    }
-    if (errored.length > 0) lines.push(this.renderQuotaErrors(errored));
-    return lines;
-  }
-
-  /** @param {QuotaAccount[]} errored */
-  renderQuotaErrors(errored) {
-    const t = theme();
-    return h_flex().id("magpie-quota-error").flex_none().w_full().h(18).gap(6).items_center().text_size(11)
-      .tooltip(errored.map((account) => `${account.name}: ${account.error}`).join("\n"))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.blocked).child(`${errored[0].name} · ${errored[0].error}`))
-      .when(errored.length > 1, (e) => e.child(div().flex_none().text_color(t.dim).child(`+ ${errored.length - 1}`)));
+    return v_flex().flex_none().w_full()
+      .child(head)
+      .child(v_flex().flex_none().w_full().px(10)
+        .child(div().relative().w_full().h(tall).children(placed)));
   }
 
   /**
-   * One titled list. Rows keep the server's order and open nothing.
+   * The Used/Left switch: a pill track with the chosen side on a white thumb.
+   *
+   * @param {*} p
+   */
+  renderQuotaMode(p) {
+    const opt = (left, label) => div().id(`magpie-quota-${left ? "left" : "used"}`).flex_none().h(22).px(10)
+      .flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_size(12).text_color(left === this.quotaLeft ? p.fg : p.muted)
+      .bg(left === this.quotaLeft ? p.card : "#00000000")
+      .tooltip(left ? "Show how much of each window is left" : "Show how much of each window is used")
+      .on_click((_e, cx) => this.setQuotaLeft(left, cx))
+      .child(label);
+    return h_flex().flex_none().p(2).gap(0).rounded(7).bg(p.pill)
+      .child(opt(false, "Used")).child(opt(true, "Left"));
+  }
+
+  /**
+   * One provider's card: head icon, bold name, plan · term; of several
+   * accounts an "All N accounts" aggregate block and a section per account.
+   *
+   * @param {QuotaAccount[]} group
+   * @param {*} p
+   */
+  renderQuotaCard(group, p) {
+    const first = group[0];
+    const several = group.length > 1;
+    const head = h_flex().flex_none().w_full().gap(7).pb(9).items_center()
+      .child(providerIcon(first.icon, 17, p))
+      .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().text_color(p.fg).child(first.name))
+      .when(!several && planSpanText(first) !== "", (e) => e
+        .child(div().flex_none().text_size(10.5).text_color(p.muted).truncate().child(planSpanText(first))));
+    const card = v_flex().id(`magpie-quota-card-${first.id}`).flex_1().min_w(0).px(12).pt(10).pb(11)
+      .rounded(10).border_1().border_color(p.line).bg(p.card)
+      .child(head);
+    if (several) {
+      const aggregate = aggregateWindows(group);
+      if (aggregate.length > 0) card.child(this.renderQuotaAll(group.length, aggregate, p));
+      group.forEach((account, i) => {
+        card.child(v_flex().flex_none().w_full()
+          .when(i > 0, (e) => e.mt(10).pt(9).border_t_1().border_color(p.line))
+          .child(this.renderQuotaAccount(account, p)));
+      });
+    } else {
+      card.child(this.renderQuotaAccount(first, p));
+    }
+    return card;
+  }
+
+  /**
+   * The "All N accounts" block: each shared window's summed count and share
+   * over a 3px bar, on the page's faint fill.
+   *
+   * @param {number} count
+   * @param {{name: string, amount: number, limit: number, unit: string, used: number}[]} windows
+   * @param {*} p
+   */
+  renderQuotaAll(count, windows, p) {
+    const left = this.quotaLeft;
+    return v_flex().flex_none().w_full().gap(6).px(10).pt(8).pb(9).mb(10).rounded(8).bg(p.pill)
+      .child(div().text_size(10.5).font_semibold().text_color(p.muted).child(`All ${count} accounts`))
+      .child(h_flex().flex_none().w_full().gap(14).flex_wrap()
+        .children(windows.map((w) => {
+          const used = clamp100(w.used);
+          const n = left ? 100 - used : used;
+          const pct = `${Number.isInteger(n) ? n : n.toFixed(1)}% ${left ? "left" : "used"}`;
+          const figure = w.limit > 0
+            ? `${group(String(left ? Math.max(0, w.limit - w.amount) : w.amount))} / ${group(String(w.limit))}${w.unit === "" ? "" : ` ${w.unit}`} · ${pct}`
+            : pct;
+          return v_flex().flex_1().min_w(120).gap(2)
+            .child(div().text_size(10.5).text_color(p.muted).truncate().child(w.name))
+            .child(div().text_size(10.5).font_semibold().text_color(p.fg2).whitespace_normal().child(figure))
+            .child(div().h(3).w_full().rounded(2).bg(p.line).overflow_hidden()
+              .child(div().h_full().rounded(2).bg(used >= 90 ? p.amber : p.accent).w(`${Math.round(left ? 100 - used : used)}%`)));
+        })));
+  }
+
+  /**
+   * One account's section: user left and plan right, its windows, the curve,
+   * its balance and when it was read. A refused account keeps its error line.
+   *
+   * @param {QuotaAccount} account
+   * @param {*} p
+   */
+  renderQuotaAccount(account, p) {
+    const box = v_flex().flex_none().w_full().gap(6);
+    if (account.user !== "" || account.alias !== "" || planSpanText(account) !== "") {
+      box.child(h_flex().flex_none().w_full().gap(7).items_baseline()
+        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(p.fg2)
+          .child(account.alias !== "" ? account.alias : account.user))
+        .when(planSpanText(account) !== "", (e) => e
+          .child(div().flex_none().text_size(10.5).text_color(p.muted).truncate().child(planSpanText(account)))));
+    }
+    if (account.error !== "") {
+      return box.child(div().text_size(11).text_color(p.muted).whitespace_normal().tooltip(account.error).child(account.error));
+    }
+    if (account.windows.length === 0 && account.balance !== "") {
+      return box.child(this.renderBalance(account, p));
+    }
+    const now = Date.now();
+    const rows = [];
+    for (let i = 0; i < account.windows.length; i += 2) {
+      rows.push(h_flex().flex_none().w_full().gap(14).items_start()
+        .child(this.renderQuotaWindow(account, account.windows[i], now, p))
+        .child(i + 1 < account.windows.length ? this.renderQuotaWindow(account, account.windows[i + 1], now, p) : div().flex_1()));
+    }
+    box.child(v_flex().flex_none().w_full().gap(9).children(rows));
+    const curve = this.renderQuotaCurve(account, now, p);
+    if (curve !== null) box.child(curve);
+    if (account.balance !== "" && account.windows.length > 0) box.child(this.renderBalance(account, p));
+    // The curve carries its own "Updated …", as the page's card does.
+    if (curve === null) {
+      const read = this.renderReadWhen(account, p);
+      if (read !== null) box.child(read);
+    }
+    return box;
+  }
+
+  /**
+   * One window: name and figure over a 3px track, the reset line with its
+   * pace and the whole-window estimate under it.
+   *
+   * @param {QuotaAccount} account
+   * @param {QuotaWindow} window
+   * @param {number} now
+   * @param {*} p
+   */
+  renderQuotaWindow(account, window, now, p) {
+    const left = this.quotaLeft;
+    const noShare = window.text || window.used === null || window.balance !== null;
+    const line = account.lines.find((l) => l.name === window.name) ?? null;
+    const start = line !== null && line.points.length > 0 ? line.points[line.points.length - 1].start : null;
+    const pace = quotaPace(window, start, left, now);
+    const resetAt = parseTime(window.resetsAt);
+    const resetParts = [];
+    if (resetAt !== null) {
+      resetParts.push(resetAt <= now ? `Reset time passed ${resetClock(resetAt, now)}` : `Resets ${resetClock(resetAt, now)}`);
+      if (resetAt > now) resetParts.push(untilText(resetAt));
+    }
+    if (window.runsOutAt !== "" && window.runsOut > 0) {
+      const outAt = parseTime(window.runsOutAt);
+      if (outAt !== null && outAt > now) resetParts.push(`${group(String(window.runsOut))}${window.unit === "" ? "" : ` ${window.unit}`} expire ${resetClock(outAt, now)}`);
+    }
+    const holds = window.holds !== null
+      ? `Whole ≈ ${formatN(window.holds.tokens)} tokens${window.holds.priced ? ` · ≈ ${formatCost(window.holds.cost)}` : ""}`
+      : window.holdsWhy !== "" ? "Whole: not enough data" : "";
+    return v_flex().flex_1().min_w(0).gap(4)
+      .child(v_flex().w_full().gap(1)
+        .child(div().w_full().truncate().text_size(10.5).text_color(p.muted).child(window.name))
+        .child(div().w_full().text_size(10.5).font_semibold().text_color(p.fg2).whitespace_normal().child(quotaText(window, left))))
+      .when(!window.unlimited && !noShare, (e) => e
+        .child(div().h(3).w_full().rounded(2).bg(p.pill).overflow_hidden()
+          .child(div().h_full().rounded(2).bg(p.accent).w(`${quotaFill(window, left)}%`))))
+      .when(resetParts.length > 0 || pace !== null || holds !== "", (e) => e
+        .child(v_flex().w_full().gap(2).pt(2)
+          .when(resetParts.length > 0 || pace !== null, (x) => x.child(h_flex().w_full().gap(4).flex_wrap()
+            .child(div().text_size(10).text_color(p.muted).whitespace_normal().child(resetParts.join(" · ")))
+            .when(pace !== null, (y) => y.child(div().text_size(10).text_color(pace.over ? p.amber : p.muted)
+              .child(`· Pace ${paceNumber(pace.n)}`)))))
+          .when(holds !== "", (x) => x.child(div().text_size(10).text_color(p.muted).whitespace_normal().child(holds)))));
+  }
+
+  /**
+   * The balance line: "Balance" left, the amount bold right, and the amber
+   * "As of …" under it when the reading stands in for one that failed.
+   *
+   * @param {QuotaAccount} account
+   * @param {*} p
+   */
+  renderBalance(account, p) {
+    const asOf = parseTime(account.asOf);
+    return v_flex().flex_none().w_full().gap(2)
+      .child(h_flex().w_full().gap(6).items_baseline()
+        .child(div().flex_1().text_size(10.5).text_color(p.muted).child("Balance"))
+        .child(div().flex_none().text_size(15).font_semibold().text_color(p.fg).child(account.balance)))
+      .when(asOf !== null, (e) => e.child(div().text_size(10).text_color(p.amber).whitespace_normal()
+        .child(`As of ${curveTimeText(asOf, Date.now())} — couldn't be read just now`)));
+  }
+
+  /**
+   * When the windows were read: "Updated …", or nothing when unknown.
+   *
+   * @param {QuotaAccount} account
+   * @param {*} p
+   */
+  renderReadWhen(account, p) {
+    const at = parseTime(account.readAt);
+    if (at === null || account.windows.length === 0) return null;
+    return div().flex_none().pt(2).text_size(10).text_color(p.muted).child(`Updated ${agoText(at)}`);
+  }
+
+  /**
+   * "Left over time": each window's left % over the current cycle, a dashed
+   * projection to the reset, axis times, legend dots and the reading's age.
+   * Nothing without history or without paint_path at runtime.
+   *
+   * @param {QuotaAccount} account
+   * @param {number} now
+   * @param {*} p
+   */
+  renderQuotaCurve(account, now, p) {
+    if (typeof window === "undefined" || typeof window.paint_path !== "function") return null;
+    const lines = [];
+    for (const w of account.windows) {
+      if (w.unlimited) continue;
+      const line = account.lines.find((l) => l.name === w.name);
+      if (!line || line.points.length === 0) continue;
+      lines.push({ window: w, line, cycle: windowCycle(line, w, now) });
+    }
+    if (lines.length === 0) return null;
+    let x0 = Infinity, x1 = now;
+    for (const { cycle } of lines) {
+      x0 = Math.min(x0, cycle.start);
+      if (cycle.reset !== null) x1 = Math.max(x1, cycle.reset);
+    }
+    if (!(x0 < now)) x0 = now - 3600e3;
+    if (!(x1 > x0)) x1 = x0 + 1;
+    const X = (at) => `${(((at - x0) / (x1 - x0)) * 100).toFixed(2)}%`;
+    const Y = (left) => `${(100 - clamp100(left)).toFixed(2)}%`;
+    const plot = div().relative().w_full().h(60).mt(5).overflow_hidden();
+    for (const v of [0, 50, 100]) {
+      plot.child(window.paint_path(PathBuilder.stroke(1).move_to("0%", `${100 - v}%`).line_to("100%", `${100 - v}%`).build(), p.line)
+        .absolute().inset_0());
+    }
+    let longest = null, latest = -Infinity;
+    lines.forEach(({ window: w, line, cycle }, i) => {
+      const color = p.series[i % p.series.length];
+      if (cycle.reset !== null && cycle.reset > latest) { latest = cycle.reset; longest = { line, cycle }; }
+      const pts = line.points.filter((pt) => pt.at >= x0 && pt.at <= x1);
+      if (pts.length > 0) {
+        let builder = PathBuilder.stroke(1.5).move_to(X(pts[0].at), Y(pts[0].left));
+        for (const pt of pts.slice(1)) builder = builder.line_to(X(pt.at), Y(pt.left));
+        plot.child(window.paint_path(builder.build(), color).absolute().inset_0());
+      }
+      const last = line.points[line.points.length - 1];
+      if (cycle.reset !== null && cycle.reset > now && last.at <= now) {
+        const eta = curveEta(line.points, cycle.start, cycle.reset, now);
+        const projected = eta !== null && eta.out !== null && eta.out < cycle.reset
+          ? Math.max(0, last.left + ((eta.out - last.at) > 0 ? -last.left / (eta.out - last.at) : 0) * (cycle.reset - last.at))
+          : last.left;
+        plot.child(window.paint_path(PathBuilder.stroke(1).dash_array([3, 3])
+          .move_to(X(last.at), Y(last.left)).line_to(X(cycle.reset), Y(projected)).build(), color)
+          .absolute().inset_0());
+      }
+    });
+    if (now >= x0 && now <= x1) {
+      plot.child(window.paint_path(PathBuilder.stroke(1).dash_array([1, 2]).move_to(X(now), "0%").line_to(X(now), "100%").build(), p.faint)
+        .absolute().inset_0());
+    }
+    const eta = longest === null ? null : curveEta(longest.line.points, longest.cycle.start, longest.cycle.reset, now);
+    const paceText = eta === null ? "" : eta.lasts ? "Lasts past the reset at this pace" : `Runs out ${curveTimeText(Math.max(eta.out ?? now, now + 60e3), now)} at this pace`;
+    const readAt = parseTime(account.readAt);
+    return v_flex().flex_none().w_full().pt(4)
+      .child(h_flex().w_full().gap(6).items_baseline()
+        .child(div().flex_none().text_size(10.5).text_color(p.muted).child("Left over time"))
+        .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(p.muted).child(paceText))
+        .child(div().flex_none().text_size(10).text_color(p.muted).child("Cycle")))
+      .child(plot)
+      .child(h_flex().w_full().pt(3).justify_between()
+        .child(div().text_size(10).text_color(p.muted).child(curveTimeText(x0, now)))
+        .child(div().text_size(10).text_color(p.muted).child(curveTimeText(x1, now))))
+      .child(h_flex().w_full().pt(5).gap(12).flex_wrap()
+        .children(lines.map(({ window: w, line }, i) => {
+          const last = line.points[line.points.length - 1];
+          return h_flex().flex_none().gap(5).items_center()
+            .child(div().size(7).rounded(4).bg(p.series[i % p.series.length]))
+            .child(div().text_size(10.5).text_color(p.muted).child(w.name))
+            .child(div().text_size(10.5).font_semibold().text_color(p.fg2).child(`${Math.round(last.left)}%`));
+        })))
+      .when(readAt !== null, (e) => e.child(div().pt(5).text_size(10).text_color(p.muted).child(`Updated ${agoText(readAt)}`)));
+  }
+
+  /**
+   * One titled list in a white 10px card, its head uppercase with a fold
+   * chevron. Rows keep the server's order and open nothing.
    *
    * @param {string} title
    * @param {string} slug
    * @param {UsageRow[]} rows
    * @param {"narrow" | "medium" | "wide"} tier
+   * @param {*} p
    */
-  renderRows(title, slug, rows, tier) {
-    const t = theme();
-    return v_flex().flex_none().w_full().px(10).pt(8)
-      .child(div().pb(4).text_size(11).font_medium().text_color(t.dim).child(title))
-      .children(rows.map((row, i) => this.renderRow(slug, i, row, tier)));
+  renderRows(title, slug, rows, tier, p) {
+    if (rows.length === 0) return null;
+    const folded = this.folded.has(slug);
+    return v_flex().flex_none().w_full().px(10).pt(14)
+      .child(h_flex().flex_none().w_full().pb(6).gap(5).items_center()
+        .child(div().id(`magpie-fold-${slug}`).flex_none().size(14).flex().items_center().justify_center()
+          .text_size(9).text_color(p.faint).cursor_pointer().rounded(3)
+          .hover((s) => s.bg(p.pill))
+          .tooltip(folded ? `Show the ${title.toLowerCase()}` : `Fold the ${title.toLowerCase()} away`)
+          .on_click((_e, cx) => this.toggleFold(slug, cx))
+          .child(folded ? "▸" : "▾"))
+        .child(div().text_size(11).font_semibold().text_color(p.muted).child(title.toUpperCase())))
+      .when(!folded, (e) => e.child(v_flex().flex_none().w_full().rounded(10).border_1().border_color(p.line).bg(p.card).overflow_hidden()
+        .children(rows.map((row, i) => this.renderRow(slug, i, row, tier, p)))));
   }
 
   /**
-   * One usage row. Medium and wide put a wrapped sub-line under the name
-   * beside the share bar, the tokens and the cost; narrow stacks the name and
-   * cost over the sub-line, the bar and the token count.
+   * One usage row: 16px icon, name and wrapped sub-line, the 4px share bar,
+   * tokens with their breakdown under, and the green cost. Narrow stacks the
+   * name and cost over the sub-line, the bar and the token count.
    *
    * @param {string} slug
    * @param {number} index
    * @param {UsageRow} row
    * @param {"narrow" | "medium" | "wide"} tier
+   * @param {*} p
    */
-  renderRow(slug, index, row, tier) {
-    const t = theme();
+  renderRow(slug, index, row, tier, p) {
     const sub = rowSubLine(row);
     const tooltip = rowTooltip(row);
+    const cost = formatRowCost(row.cost, row.unpriced);
+    const border = index > 0 ? (e) => e.border_t_1().border_color(p.line2) : (e) => e;
     if (tier === "narrow") {
-      return v_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(4).gap(2).tooltip(tooltip)
+      return v_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(7).pl(14).pr(12).gap(2).tooltip(tooltip).map(border)
         .child(h_flex().w_full().gap(6).items_center()
-          .child(div().flex_1().min_w(0).truncate().child(row.name))
-          .child(div().flex_none().text_size(11).text_color(t.ansi2).child(formatCost(row.cost))))
-        .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.muted).whitespace_normal().child(sub)))
+          .child(providerIcon(row.icon, 16, p))
+          .child(div().flex_1().min_w(0).truncate().text_size(13).font_medium().text_color(p.fg).child(row.name))
+          .when(cost !== "", (e) => e.child(div().flex_none().text_size(12).text_color(p.green).child(cost))))
+        .when(sub !== "", (e) => e.child(div().text_size(11.5).text_color(p.muted).whitespace_normal().child(sub)))
         .child(h_flex().w_full().gap(6).items_center()
-          .child(this.renderShareBar(row, 2, null))
-          .child(div().flex_none().text_size(10).text_color(t.muted).child(formatTokens(row.tokens))));
+          .child(this.renderShareBar(row, p))
+          .child(div().flex_none().text_size(11).font_semibold().text_color(p.fg).child(formatN(row.tokens))));
     }
-    return h_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(4).gap(8).items_center().tooltip(tooltip)
-      .child(v_flex().flex_1().min_w(0)
-        .child(div().truncate().child(row.name))
-        .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.muted).whitespace_normal().child(sub))))
-      .child(this.renderShareBar(row, 4, 48))
+    return h_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(7).pl(14).pr(12).gap(12).items_center().tooltip(tooltip).map(border)
+      .child(providerIcon(row.icon, 16, p))
+      .child(v_flex().flex_1().min_w(120).max_w(180)
+        .child(div().truncate().text_size(13).font_medium().text_color(p.fg).child(row.name))
+        .when(sub !== "", (e) => e.child(div().pt(1).text_size(11.5).text_color(p.muted).whitespace_normal().child(sub))))
+      .child(this.renderShareBar(row, p))
       .child(v_flex().flex_none().items_end()
-        .child(div().text_size(11).child(formatTokens(row.tokens)))
-        .child(div().text_size(10).text_color(t.dim).child(tokenBreakdown(row))))
-      .child(div().flex_none().w(52).text_right().text_size(11).text_color(t.ansi2).child(formatCost(row.cost)));
+        .child(div().text_size(13).font_semibold().text_color(p.fg).child(formatN(row.tokens)))
+        .child(div().text_size(10.5).text_color(p.muted).whitespace_nowrap().child(tokenBreakdown(row))))
+      .child(div().flex_none().w(64).text_right().text_size(12).text_color(p.green).child(cost));
   }
 
   /**
+   * The row's share of the period's tokens: a 4px track filling the row's
+   * middle, the fill at least 1.5% so a tiny share still shows.
+   *
    * @param {UsageRow} row
-   * @param {number} height
-   * @param {number | null} width null fills the row
+   * @param {*} p
    */
-  renderShareBar(row, height, width) {
-    const t = theme();
-    const bar = v_flex().h(height).rounded(height / 2).bg(t.hover).overflow_hidden()
-      .when(row.share > 0, (e) => e.child(div().h_full().rounded(height / 2).bg(t.accent).opacity(0.7)
-        .w(`${Math.max(1.5, Math.min(100, row.share * 100)).toFixed(1)}%`)));
-    return width === null ? bar.flex_1().min_w(0) : bar.flex_none().w(width);
+  renderShareBar(row, p) {
+    return v_flex().flex_1().min_w(0).h(4).rounded(2).bg(p.pill).overflow_hidden()
+      .tooltip(`${Math.round(row.share * 100)}% of tokens`)
+      .child(div().h_full().rounded(2).bg(p.accent).opacity(0.7)
+        .w(`${Math.max(1.5, Math.min(100, row.share * 100)).toFixed(1)}%`));
   }
 }
 
@@ -1903,20 +2665,24 @@ function rowSubLine(row) {
   const parts = [];
   if (row.detail !== "") parts.push(row.detail);
   if (row.calls > 0) parts.push(`${formatInt(row.calls)} ${row.calls === 1 ? "call" : "calls"}`);
+  if (row.credited > 0) parts.push(`${formatN(row.credits)} credits`);
+  if (row.ownCalls > 0) parts.push(`${formatInt(row.ownCalls)} by magpie itself`);
   if (row.errors > 0) parts.push(`${formatInt(row.errors)} failed`);
   if (row.loops > 0) parts.push(`${formatInt(row.loops)} looped`);
-  if (row.retried > 0) parts.push(`${formatInt(row.retried)} retried`);
+  if (row.retried > 0) parts.push(`${formatInt(row.retried)} answered on a retry`);
   if (row.canceled > 0) parts.push(`${formatInt(row.canceled)} canceled`);
   if (row.timed > 0) parts.push(`TTFT ${formatTook(row.ttftMs / row.timed)}`);
   if (row.decodeMs > 0 && row.decodeOut > 0) parts.push(`${formatInt((row.decodeOut / row.decodeMs) * 1000)} tok/s`);
-  if (row.ownCalls > 0) parts.push(`${formatInt(row.ownCalls)} by magpie itself`);
+  if (row.timed > 0) parts.push(`${formatInt(row.timed)} timed ${row.timed === 1 ? "reply" : "replies"}`);
   return parts.join(" · ");
 }
 
 /** @param {UsageRow} row */
 function tokenBreakdown(row) {
-  const parts = [`${formatTokens(row.input)} in`, `${formatTokens(row.output)} out`];
-  if (row.cacheRead > 0) parts.push(`${formatTokens(row.cacheRead)} cached`);
+  const parts = [`${formatN(row.input)} in`, `${formatN(row.output)} out`];
+  if (row.cacheRead > 0) parts.push(`${formatN(row.cacheRead)} cached`);
+  const prompt = row.input + row.cacheRead + row.cacheWrite;
+  if (row.cacheRead > 0 && prompt > 0) parts.push(`hit rate ${formatPercent(row.cacheRead / prompt)}`);
   return parts.join(" · ");
 }
 
