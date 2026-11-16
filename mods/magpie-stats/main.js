@@ -5,12 +5,16 @@ import { URL } from "url";
 
 const REFRESH_MS = 30_000;
 const CHART_LIMIT = 30;
-const AGENT_LIMIT = 2;
-const MODEL_LIMIT = 3;
 const QUOTA_LIMIT = 4;
-// A tab is much wider than the sidebar this was designed for; a centered
-// column keeps rows and the chart readable.
-const WIDE_MAX = 560;
+
+// Rail, narrow, medium and wide, by the panel's own width. The content is one
+// 560 column until it can hold two of them side by side.
+const RAIL_WIDTH = 160;
+const NARROW_WIDTH = 420;
+const MEDIUM_WIDTH = 760;
+const COLUMN_WIDTH = 560;
+const COLUMN_GAP = 16;
+const CONTENT_WIDTH = COLUMN_WIDTH * 2 + COLUMN_GAP;
 
 // The watch list is shared by every docked copy through one file under the
 // app home, written with compare-and-swap. The default instance is derived,
@@ -40,42 +44,57 @@ const PERIODS = /** @type {const} */ ([
 
 /**
  * @typedef {{
- *   calls: number, errors: number, cost: number, unpriced: number,
- *   input: number, output: number,
- *   cacheRead: number, cacheWrite: number, reasoning: number
+ *   calls: number, errors: number, retried: number, canceled: number, loops: number,
+ *   input: number, output: number, cacheRead: number, cacheWrite: number,
+ *   reasoning: number, cost: number, unpriced: number,
+ *   credits: number, credited: number,
+ *   timed: number, ttftMs: number, decodeMs: number, decodeOut: number, decodeN: number,
+ *   upBytes: number, downBytes: number
  * }} Totals
  */
 
 /**
- * `share` is null only when the whole period has no input or output tokens.
+ * One row of Agents, Models, Accounts or Gateway keys. tokens is input +
+ * output; share is its part of the period's tokens, or 0 when the period has
+ * none.
+ *
  * @typedef {{
  *   id: string, name: string, detail: string,
- *   calls: number, errors: number, cost: number,
- *   tokens: number, share: number | null
- * }} Share
+ *   calls: number, errors: number, retried: number, canceled: number, loops: number,
+ *   cost: number, unpriced: number,
+ *   input: number, output: number,
+ *   cacheRead: number, cacheWrite: number, reasoning: number,
+ *   tokens: number, timed: number, ttftMs: number, decodeMs: number, decodeOut: number,
+ *   decodeN: number, ownCalls: number, share: number
+ * }} UsageRow
  */
-
-/** @typedef {{totalCount: number, rows: Share[]}} ShareList */
 
 /**
  * @typedef {{
- *   bucket: "hour" | "day" | "week", truncated: boolean,
- *   bars: Array<{key: string, label: string,
- *                calls: number, errors: number, cost: number}>
+ *   key: string, label: string,
+ *   calls: number, errors: number, cost: number,
+ *   input: number, output: number, cacheRead: number, cacheWrite: number,
+ *   reasoning: number
+ * }} ChartPoint
+ */
+
+/**
+ * @typedef {{
+ *   bucket: "hour" | "day" | "week", truncated: boolean, points: ChartPoint[]
  * }} Chart
  */
 
 /**
  * @typedef {{
- *   period: Period, receivedAt: number, totals: Totals,
- *   chart: Chart, agents: ShareList, models: ShareList
- * }} UsageSnapshot
+ *   period: Period, receivedAt: number, totals: Totals, chart: Chart,
+ *   agents: UsageRow[], models: UsageRow[], accounts: UsageRow[], keys: UsageRow[]
+ * }} UsagePageSnapshot
  */
 
 /**
  * @typedef {{kind: "loading"}
- *   | {kind: "ready", snapshot: UsageSnapshot}
- *   | {kind: "stale", snapshot: UsageSnapshot, problem: Problem}
+ *   | {kind: "ready", snapshot: UsagePageSnapshot}
+ *   | {kind: "stale", snapshot: UsagePageSnapshot, problem: Problem}
  *   | {kind: "unavailable", problem: Problem}} PeriodState
  */
 
@@ -107,9 +126,11 @@ const PERIODS = /** @type {const} */ ([
  *   | {kind: "unavailable", problem: Problem}} QuotaState
  */
 
-/** Return `totals.input + totals.output`. @param {Totals} totals */
-function nonCacheTokens(totals) {
-  return totals.input + totals.output;
+/** @param {number} width */
+function tierOf(width) {
+  if (width < NARROW_WIDTH) return "narrow";
+  if (width < MEDIUM_WIDTH) return "medium";
+  return "wide";
 }
 
 function bad(kind, detail) {
@@ -486,7 +507,7 @@ function responseProblem(response, url) {
 /**
  * @param {GatewayInstance} instance
  * @param {Period} period
- * @returns {Promise<UsageSnapshot>}
+ * @returns {Promise<UsagePageSnapshot>}
  */
 async function loadUsage(instance, period) {
   const { origin, headers } = await resolveGateway(instance);
@@ -519,14 +540,50 @@ function badResponse(detail) {
 }
 
 /**
+ * @param {Record<string, unknown>} obj
+ * @param {string} name
+ */
+function requiredNumber(obj, name) {
+  if (!finiteNonnegative(obj[name])) {
+    throw badResponse(`field "${name}" is missing or not a finite nonnegative number`);
+  }
+  return /** @type {number} */ (obj[name]);
+}
+
+/**
+ * A count the gateway may leave out: absent or unusable reads as 0, never NaN.
+ *
+ * @param {Record<string, unknown>} obj
+ * @param {string} name
+ */
+function optionalNumber(obj, name) {
+  const value = obj[name];
+  return finiteNonnegative(value) ? /** @type {number} */ (value) : 0;
+}
+
+/**
+ * A list the gateway may leave out: absent is empty, anything else is a bad
+ * answer.
+ *
+ * @param {Record<string, unknown>} obj
+ * @param {string} name
+ */
+function listOf(obj, name) {
+  const value = obj[name];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw badResponse(`${name} is not an array`);
+  return value;
+}
+
+/**
  * Validate raw JSON and convert it to the domain model. Missing or malformed
  * required data throws "bad-response"; junk is never clamped into zero. Every
- * field not named in UsageSnapshot is ignored here and nowhere else.
+ * field not named in UsagePageSnapshot is ignored here and nowhere else.
  *
  * @param {unknown} raw
  * @param {Period} period
  * @param {number} receivedAt
- * @returns {UsageSnapshot}
+ * @returns {UsagePageSnapshot}
  */
 function parseUsage(raw, period, receivedAt) {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw badResponse("payload is not an object");
@@ -534,74 +591,112 @@ function parseUsage(raw, period, receivedAt) {
   if (obj.period !== period) throw badResponse(`payload period "${String(obj.period)}" does not match "${period}"`);
   const bucket = obj.bucket;
   if (bucket !== "hour" && bucket !== "day" && bucket !== "week") throw badResponse(`unknown bucket "${String(bucket)}"`);
-  const numbers = ["calls", "errors", "cost", "unpriced", "input", "output", "cache_read", "cache_write", "reasoning"];
-  for (const name of numbers) {
-    if (!finiteNonnegative(obj[name])) throw badResponse(`field "${name}" is missing or not a finite nonnegative number`);
-  }
   if (!Array.isArray(obj.series)) throw badResponse("series is not an array");
   if (!Array.isArray(obj.agents)) throw badResponse("agents is not an array");
   if (!Array.isArray(obj.models)) throw badResponse("models is not an array");
 
   const totals = {
-    calls: obj.calls, errors: obj.errors, cost: obj.cost, unpriced: obj.unpriced,
-    input: obj.input, output: obj.output,
-    cacheRead: obj.cache_read, cacheWrite: obj.cache_write, reasoning: obj.reasoning,
+    calls: requiredNumber(obj, "calls"),
+    errors: requiredNumber(obj, "errors"),
+    retried: optionalNumber(obj, "retried"),
+    canceled: optionalNumber(obj, "canceled"),
+    loops: optionalNumber(obj, "loops"),
+    input: requiredNumber(obj, "input"),
+    output: requiredNumber(obj, "output"),
+    cacheRead: optionalNumber(obj, "cache_read"),
+    cacheWrite: optionalNumber(obj, "cache_write"),
+    reasoning: optionalNumber(obj, "reasoning"),
+    cost: requiredNumber(obj, "cost"),
+    unpriced: optionalNumber(obj, "unpriced"),
+    credits: optionalNumber(obj, "credits"),
+    credited: optionalNumber(obj, "credited"),
+    timed: optionalNumber(obj, "timed"),
+    ttftMs: optionalNumber(obj, "ttft_ms"),
+    decodeMs: optionalNumber(obj, "decode_ms"),
+    decodeOut: optionalNumber(obj, "decode_out"),
+    decodeN: optionalNumber(obj, "decode_n"),
+    upBytes: optionalNumber(obj, "up_bytes"),
+    downBytes: optionalNumber(obj, "down_bytes"),
   };
-  const periodTokens = nonCacheTokens(totals);
+  const periodTokens = totals.input + totals.output;
 
-  const bars = obj.series.slice(-CHART_LIMIT).map((point, i, kept) => {
+  const points = obj.series.slice(-CHART_LIMIT).map((point, i) => {
     if (typeof point !== "object" || point === null) throw badResponse("a series point is not an object");
     const p = /** @type {Record<string, unknown>} */ (point);
-    for (const name of ["calls", "errors", "cost"]) {
-      if (!finiteNonnegative(p[name])) throw badResponse(`a series point's "${name}" is missing or invalid`);
-    }
     if (typeof p.label !== "string" || typeof p.time !== "string") throw badResponse("a series point has no label or time");
     // The kept array's own indices keep keys unique after slicing; the point's
     // time makes them stable across refreshes whose windows shift.
-    return { key: `${p.time}:${i}`, label: p.label, calls: p.calls, errors: p.errors, cost: p.cost };
+    return {
+      key: `${p.time}:${i}`, label: p.label,
+      calls: requiredNumber(p, "calls"),
+      errors: requiredNumber(p, "errors"),
+      cost: requiredNumber(p, "cost"),
+      input: requiredNumber(p, "input"),
+      output: requiredNumber(p, "output"),
+      cacheRead: optionalNumber(p, "cache_read"),
+      cacheWrite: optionalNumber(p, "cache_write"),
+      reasoning: optionalNumber(p, "reasoning"),
+    };
   });
-  const chart = { bucket, truncated: obj.series.length > bars.length, bars };
+  const chart = { bucket, truncated: obj.series.length > points.length, points };
 
-  const agents = obj.agents.map((entry) => parseShare(entry, periodTokens, { name: ["name", "id"], detail: [] }));
-  const models = obj.models.map((entry) => parseShare(entry, periodTokens, { name: ["name", "model", "id"], detail: ["sub", "provider"] }));
-  return {
-    period, receivedAt, totals, chart,
-    agents: { totalCount: agents.length, rows: agents.slice(0, AGENT_LIMIT) },
-    models: { totalCount: models.length, rows: models.slice(0, MODEL_LIMIT) },
-  };
+  const agents = obj.agents.map((entry) => parseUsageRow(entry, periodTokens, { name: ["name", "id"], detail: [] }));
+  const models = obj.models.map((entry) => parseUsageRow(entry, periodTokens, { name: ["model", "name", "id"], detail: ["sub", "provider"] }));
+  const accounts = listOf(obj, "accounts").map((entry) => parseUsageRow(entry, periodTokens, {
+    name: ["account", "name", "id"], detail: ["sub", "provider"], emptyName: "account not recorded",
+  }));
+  const keys = listOf(obj, "callerKeys").map((entry) => parseUsageRow(entry, periodTokens, {
+    name: ["callerKeyName", "name", "callerKeyId"], detail: ["sub", "provider"],
+  }));
+  return { period, receivedAt, totals, chart, agents, models, accounts, keys };
 }
 
 /**
- * Validate one agent or model. tokens is input + output. share is tokens
- * divided by the period's input + output, or null when that denominator is
- * zero. The server's order is preserved instead of sorting again.
+ * Validate one list entry. calls, errors, cost, input and output are required;
+ * everything else the server may leave out reads as 0. The server's order is
+ * preserved instead of sorting again.
  *
  * @param {unknown} raw
  * @param {number} periodTokens
- * @param {{name: string[], detail: string[]}} fallbacks
- * @returns {Share}
+ * @param {{name: string[], detail: string[], emptyName?: string}} fallbacks
+ * @returns {UsageRow}
  */
-function parseShare(raw, periodTokens, fallbacks) {
-  if (typeof raw !== "object" || raw === null) throw badResponse("a share entry is not an object");
+function parseUsageRow(raw, periodTokens, fallbacks) {
+  if (typeof raw !== "object" || raw === null) throw badResponse("a usage row is not an object");
   const obj = /** @type {Record<string, unknown>} */ (raw);
-  for (const name of ["calls", "errors", "cost", "input", "output"]) {
-    if (!finiteNonnegative(obj[name])) throw badResponse(`a share entry's "${name}" is missing or invalid`);
-  }
-  const pick = (names, what) => {
+  const pick = (names) => {
     for (const name of names) {
       const value = obj[name];
-      if (typeof value === "string" && value) return value;
+      if (typeof value === "string" && value !== "") return value;
     }
-    throw badResponse(`a share entry has no ${what}`);
+    return "";
   };
-  const id = pick(["id"], "id");
+  const own = typeof obj.own === "object" && obj.own !== null ? /** @type {Record<string, unknown>} */ (obj.own) : null;
+  const input = requiredNumber(obj, "input");
+  const output = requiredNumber(obj, "output");
   return {
-    id,
-    name: pick(fallbacks.name, "name"),
-    detail: fallbacks.detail.map((name) => (typeof obj[name] === "string" ? /** @type {string} */ (obj[name]) : "")).find((value) => value !== "") ?? "",
-    calls: obj.calls, errors: obj.errors, cost: obj.cost,
-    tokens: obj.input + obj.output,
-    share: periodTokens > 0 ? (obj.input + obj.output) / periodTokens : null,
+    id: typeof obj.id === "string" ? obj.id : "",
+    name: pick(fallbacks.name) || fallbacks.emptyName || "",
+    detail: pick(fallbacks.detail),
+    calls: requiredNumber(obj, "calls"),
+    errors: requiredNumber(obj, "errors"),
+    retried: optionalNumber(obj, "retried"),
+    canceled: optionalNumber(obj, "canceled"),
+    loops: optionalNumber(obj, "loops"),
+    cost: requiredNumber(obj, "cost"),
+    unpriced: optionalNumber(obj, "unpriced"),
+    input, output,
+    cacheRead: optionalNumber(obj, "cache_read"),
+    cacheWrite: optionalNumber(obj, "cache_write"),
+    reasoning: optionalNumber(obj, "reasoning"),
+    tokens: input + output,
+    timed: optionalNumber(obj, "timed"),
+    ttftMs: optionalNumber(obj, "ttft_ms"),
+    decodeMs: optionalNumber(obj, "decode_ms"),
+    decodeOut: optionalNumber(obj, "decode_out"),
+    decodeN: optionalNumber(obj, "decode_n"),
+    ownCalls: own === null ? 0 : optionalNumber(own, "calls"),
+    share: periodTokens > 0 ? (input + output) / periodTokens : 0,
   };
 }
 
@@ -777,6 +872,18 @@ function formatTokens(value) {
 /** Format grouped USD with exactly two decimals, such as "$509.40". @param {number} value */
 function formatCost(value) {
   return `$${group(value.toFixed(2))}`;
+}
+
+/**
+ * A first-token wait: whole milliseconds under a second, then seconds with a
+ * decimal under ten. Rounding first keeps 999.6 ms reading "1.0 s", not
+ * "1000 ms".
+ *
+ * @param {number} ms
+ */
+function formatTook(ms) {
+  const rounded = Math.round(ms);
+  return rounded < 1000 ? `${rounded} ms` : `${(rounded / 1000).toFixed(rounded < 10_000 ? 1 : 0)} s`;
 }
 
 /** Format null as "n/a", a positive share below one percent as "<1%", and others rounded. @param {number | null} value */
@@ -1233,11 +1340,12 @@ export default class MagpieStats extends View {
     const runtime = this.runtimeFor(instance.id);
     const state = runtime.states.get(this.periodFor(instance.id)) ?? { kind: "loading" };
     const quota = runtime.quota;
-    if (this.width < 160) return this.renderRail(instance, state, t);
+    if (this.width < RAIL_WIDTH) return this.renderRail(instance, state, t);
+    const tier = tierOf(this.width);
     const busy = runtime.inFlight.has(this.periodFor(instance.id));
     const status = statusOf(state, t);
     const column = v_flex().min_h(0).h_full().w_full()
-      .when(this.width > WIDE_MAX, (e) => e.max_w(WIDE_MAX))
+      .max_w(tier === "wide" ? CONTENT_WIDTH : COLUMN_WIDTH)
       .child(h_flex().flex_none().px(10).pt(8).pb(4).gap(6).items_center()
         .child(div().font_semibold().cursor_pointer().tooltip("Switch gateway")
           .hover((s) => s.bg(t.hover)).rounded(5)
@@ -1268,7 +1376,7 @@ export default class MagpieStats extends View {
             .on_click((_e, cx) => this.selectPeriod(p.id, cx))
             .child(p.label);
         })))
-      .child(this.renderBody(state, quota, t));
+      .child(this.renderBody(state, quota, tier, t));
     return v_flex().id("magpie-stats").size_full().min_h(0).overflow_hidden().items_center()
       .bg(t.chrome).text_color(t.foreground).text_size(12)
       .on_size_change((size, cx) => {
@@ -1440,8 +1548,9 @@ export default class MagpieStats extends View {
    *
    * @param {PeriodState} state
    * @param {QuotaState} quota
+   * @param {"narrow" | "medium" | "wide"} tier
    */
-  renderBody(state, quota, t) {
+  renderBody(state, quota, tier, t) {
     if (state.kind === "loading") {
       return div().flex_1().min_h(0).px(10).pt(8).text_color(t.dim).child("Reading Magpie usage…");
     }
@@ -1451,7 +1560,7 @@ export default class MagpieStats extends View {
         .child(div().font_medium().text_color(t.foreground).child(copy.title))
         .child(div().text_size(11).text_color(t.dim).tooltip(state.problem.detail).child(copy.body));
     }
-    const content = this.renderSnapshot(state.snapshot, quota);
+    const content = this.renderSnapshot(state.snapshot, quota, tier);
     if (state.kind !== "stale") return content;
     return v_flex().flex_1().min_h(0)
       .child(content)
@@ -1461,51 +1570,155 @@ export default class MagpieStats extends View {
   }
 
   /**
+   * The Overview: cost, tiles, chart and the four lists. Wide splits it into
+   * two columns; narrow and medium keep one, in the page's order.
    *
-   * @param {UsageSnapshot} snapshot
+   * @param {UsagePageSnapshot} snapshot
    * @param {QuotaState} quota
+   * @param {"narrow" | "medium" | "wide"} tier
    */
-  renderSnapshot(snapshot, quota) {
-    const t = theme();
-    const totals = snapshot.totals;
-    const cost = h_flex().flex_none().px(10).pt(6).gap(6).items_end().flex_wrap()
-      .child(div().text_size(17).font_semibold().child(formatCost(totals.cost)))
-      .when(totals.unpriced > 0, (e) => e.child(div().text_size(11).pb(1).text_color(t.dim).child(`+ ${formatInt(totals.unpriced)} unpriced`)));
-    const calls = h_flex().flex_none().px(10).pt(3).gap(6).items_center().flex_wrap().text_color(t.muted)
-      .child(div().child(`${formatInt(totals.calls)} calls`))
-      .when(totals.errors > 0, (e) => e.child(div().text_color(t.blocked).child(`· ${formatInt(totals.errors)} errors`)));
-    // Input, output, and cache-read tokens share one tooltip with the classes
-    // that don't get their own line; an all-zero period omits the line entirely.
-    const shownTokens = totals.input > 0 || totals.output > 0 || totals.cacheRead > 0;
-    const tokenTooltip = [
-      `Input ${formatTokens(totals.input)} (${formatInt(totals.input)})`,
-      `Output ${formatTokens(totals.output)} (${formatInt(totals.output)})`,
-      `Cache read ${formatTokens(totals.cacheRead)} (${formatInt(totals.cacheRead)})`,
-      `Cache write ${formatTokens(totals.cacheWrite)} (${formatInt(totals.cacheWrite)})`,
-      `Reasoning ${formatTokens(totals.reasoning)} (${formatInt(totals.reasoning)})`,
-      `Unpriced calls ${formatInt(totals.unpriced)}`,
-    ].join("\n");
-    const tokens = shownTokens
-      ? h_flex().id("magpie-tokens").flex_none().px(10).pt(3).gap(6).items_center().flex_wrap().text_size(11).text_color(t.dim)
-          .tooltip(tokenTooltip)
-          .child(div().child(`${formatTokens(totals.input)} in · ${formatTokens(totals.output)} out`))
-          .when(totals.cacheRead > 0, (e) => e.child(div().child(`${formatTokens(totals.cacheRead)} cache read`)))
-      : null;
-    const quotaSection = this.renderQuota(quota);
-    return v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll()
-      .child(cost).child(calls).when(tokens !== null, (e) => e.child(tokens))
-      .when(quotaSection !== null, (e) => e.child(quotaSection))
-      .child(this.renderChart(snapshot.chart))
-      // One agent at 100% carries no routing information.
-      .when(snapshot.agents.totalCount > 1, (e) => e.child(this.renderShareSection("Agents", snapshot.agents)))
-      .child(this.renderShareSection("Models", snapshot.models));
+  renderSnapshot(snapshot, quota, tier) {
+    const cost = this.renderCost(snapshot.totals);
+    const kpis = this.renderKpis(snapshot.totals, tier);
+    const chart = this.renderChart(snapshot.chart, tier);
+    const allowances = this.renderAllowances(quota, tier);
+    const scroll = v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll().items_center();
+
+    if (tier === "wide") {
+      const left = [cost, kpis, chart];
+      if (snapshot.agents.length > 0) left.push(this.renderRows("Agents", "agents", snapshot.agents, tier));
+      const right = [];
+      if (allowances !== null) right.push(allowances);
+      if (snapshot.models.length > 0) right.push(this.renderRows("Models", "models", snapshot.models, tier));
+      if (snapshot.accounts.length > 0) right.push(this.renderRows("Accounts", "accounts", snapshot.accounts, tier));
+      if (snapshot.keys.length > 0) right.push(this.renderRows("Gateway keys", "gateway-keys", snapshot.keys, tier));
+      return scroll.child(h_flex().flex_none().w_full().max_w(CONTENT_WIDTH).gap(COLUMN_GAP).items_start()
+        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(left))
+        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(right)));
+    }
+
+    const sections = [cost];
+    if (allowances !== null) sections.push(allowances);
+    sections.push(kpis, chart);
+    if (snapshot.agents.length > 0) sections.push(this.renderRows("Agents", "agents", snapshot.agents, tier));
+    if (snapshot.models.length > 0) sections.push(this.renderRows("Models", "models", snapshot.models, tier));
+    if (snapshot.accounts.length > 0) sections.push(this.renderRows("Accounts", "accounts", snapshot.accounts, tier));
+    if (snapshot.keys.length > 0) sections.push(this.renderRows("Gateway keys", "gateway-keys", snapshot.keys, tier));
+    return scroll.child(v_flex().flex_none().w_full().max_w(COLUMN_WIDTH).children(sections));
   }
 
   /**
+   * The period's cost at effective prices, or the count that has none beside
+   * it, so a total never reads as if those cost nothing.
+   *
+   * @param {Totals} totals
+   */
+  renderCost(totals) {
+    const t = theme();
+    const unpriced = totals.unpriced;
+    const note = unpriced > 0
+      ? `${formatInt(unpriced)} ${unpriced === 1 ? "call" : "calls"} unpriced`
+      : "effective prices";
+    const tooltip = unpriced > 0
+      ? `${formatInt(unpriced)} ${unpriced === 1 ? "call had" : "calls had"} no known price and ${unpriced === 1 ? "is" : "are"} not counted`
+      : "Estimated at effective model prices. A model's price at one provider is set in that provider's Model settings and counts over its list price";
+    return h_flex().id("magpie-cost").flex_none().px(10).pt(6).gap(6).items_end().flex_wrap()
+      .child(div().text_size(17).font_semibold().child(`≈${formatCost(totals.cost)}`))
+      .child(div().text_size(11).pb(1).text_color(t.dim).tooltip(tooltip).child(note));
+  }
+
+  /**
+   * Four tiles: tokens, cache read, reasoning, calls. Narrow stacks them two
+   * by two; medium and wide keep one row.
+   *
+   * @param {Totals} totals
+   * @param {"narrow" | "medium" | "wide"} tier
+   */
+  renderKpis(totals, tier) {
+    const t = theme();
+    const tokens = totals.input + totals.output;
+    const prompt = tokens + totals.cacheRead + totals.cacheWrite;
+    const hit = totals.cacheRead > 0 && prompt > 0 ? totals.cacheRead / prompt : null;
+    const failed = [
+      totals.errors > 0 ? `${formatInt(totals.errors)} failed` : "",
+      totals.retried > 0 ? `${formatInt(totals.retried)} retried` : "",
+      totals.canceled > 0 ? `${formatInt(totals.canceled)} canceled` : "",
+      totals.unpriced > 0 ? `${formatInt(totals.unpriced)} unpriced` : "",
+    ].filter(Boolean).join(" · ");
+    const cacheTooltip = [
+      `Cache written ${formatTokens(totals.cacheWrite)} (${formatInt(totals.cacheWrite)})`,
+      `Reasoning ${formatTokens(totals.reasoning)} (${formatInt(totals.reasoning)})`,
+    ].join("\n");
+    const unpricedTooltip = totals.unpriced > 0
+      ? `${formatInt(totals.unpriced)} ${totals.unpriced === 1 ? "call had" : "calls had"} no known price and ${totals.unpriced === 1 ? "is" : "are"} not counted`
+      : "";
+    const tile = (id, value, label, sub, tooltip) => v_flex().id(id).flex_1().min_w(0).p(8).gap(1).bg(t.raised)
+      .when(tooltip !== "", (e) => e.tooltip(tooltip))
+      .child(div().text_size(16).font_semibold().truncate().child(value))
+      .child(div().text_size(10).text_color(t.muted).child(label))
+      .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.dim).whitespace_normal().child(sub)));
+    const tiles = [
+      tile("magpie-kpi-tokens", formatTokens(tokens), "tokens", `${formatTokens(totals.input)} in · ${formatTokens(totals.output)} out`, ""),
+      tile("magpie-kpi-cache", formatTokens(totals.cacheRead), "cache read", hit === null ? "" : `hit rate ${formatPercent(hit)}`, cacheTooltip),
+      tile("magpie-kpi-reasoning", formatTokens(totals.reasoning), "reasoning", "inside output", ""),
+      tile("magpie-kpi-calls", formatInt(totals.calls), "calls", failed, unpricedTooltip),
+    ];
+    const grid = v_flex().flex_none().w_full().gap(1).bg(t.border).border_1().border_color(t.border).rounded(8).overflow_hidden();
+    if (tier === "narrow") {
+      return v_flex().flex_none().px(10).pt(8)
+        .child(grid.child(h_flex().gap(1).children(tiles.slice(0, 2))).child(h_flex().gap(1).children(tiles.slice(2))));
+    }
+    return v_flex().flex_none().px(10).pt(8).child(grid.child(h_flex().gap(1).children(tiles)));
+  }
+
+  /**
+   * The chart: input stacked under output, scaled by tokens. The height
+   * follows the tier; a nonzero bar is at least 2px. No SVG, canvas, or
+   * animation timer.
+   *
+   * @param {Chart} chart
+   * @param {"narrow" | "medium" | "wide"} tier
+   */
+  renderChart(chart, tier) {
+    const t = theme();
+    const height = tier === "narrow" ? 32 : tier === "medium" ? 56 : 72;
+    const peak = chart.points.reduce((max, point) => Math.max(max, point.input + point.output), 0);
+    const every = chart.points.length <= 8 ? 1 : Math.ceil(chart.points.length / 6);
+    const empty = chart.points.length === 0 || peak === 0;
+    const bars = h_flex().id("magpie-chart").w_full().h(height).items_end().gap(1)
+      .when(empty, (e) => e.items_center().justify_center().text_size(11).text_color(t.dim).child("No calls in this period"))
+      .when(!empty, (e) => e.children(chart.points.map((point) => {
+        const tokens = point.input + point.output;
+        const barHeight = tokens <= 0 ? 0 : Math.max(2, Math.round((tokens / peak) * height));
+        const outputHeight = tokens <= 0 ? 0 : Math.round((point.output / tokens) * barHeight);
+        const inputHeight = barHeight - outputHeight;
+        return div().id(`magpie-bar-${point.key}`).flex_1().min_w(0).h(height).flex().items_end()
+          .when(barHeight > 0, (e) => e.child(v_flex().w_full().h(barHeight).flex_none().rounded(1).overflow_hidden()
+            .when(outputHeight > 0, (x) => x.child(div().w_full().h(outputHeight).flex_none().bg(t.accent)))
+            .when(inputHeight > 0, (x) => x.child(div().w_full().h(inputHeight).flex_none().bg(t.accent).opacity(0.38)))))
+          .tooltip(pointTooltip(point, chart.bucket));
+      })));
+    return v_flex().flex_none().px(10).pt(8)
+      .child(v_flex().flex_none().w_full().gap(3).p(8).rounded(8).border_1().border_color(t.border).bg(t.raised)
+        .when(!empty, (e) => e.child(h_flex().w_full().items_end().justify_end()
+          .child(div().text_size(10).text_color(t.dim).child(formatTokens(peak)))))
+        .child(bars)
+        .when(!empty, (e) => e.child(h_flex().w_full().gap(1)
+          .children(chart.points.map((point, i) => div().flex_1().min_w(0).text_size(9).text_color(t.dim)
+            .whitespace_nowrap().child(i % every === 0 ? point.label : "")))))
+        .when(chart.truncated, (e) => e.child(div().text_size(10).text_color(t.dim)
+          .child(`Calls by ${chart.bucket} · last ${CHART_LIMIT}`))));
+  }
+
+  /**
+   * The allowances: a card per account, two per row, at medium and wide; the
+   * compact rows in narrow. Loading and an empty payload draw nothing, and a
+   * refused account keeps its one line.
    *
    * @param {QuotaState} quota
+   * @param {"narrow" | "medium" | "wide"} tier
    */
-  renderQuota(quota) {
+  renderAllowances(quota, tier) {
     const t = theme();
     if (quota.kind === "loading") return null;
     if (quota.kind === "unavailable") {
@@ -1515,93 +1728,231 @@ export default class MagpieStats extends View {
     }
     const accounts = quota.snapshot.accounts;
     if (accounts.length === 0) return null;
+    const title = div().pb(2).text_size(11).font_medium().text_color(t.dim)
+      .when(quota.kind === "stale", (e) => e.tooltip(problemCopy(quota.problem).body))
+      .child(quota.kind === "stale" ? "Allowances · stale" : "Allowances");
+    if (tier === "narrow") {
+      return v_flex().flex_none().px(10).pt(8).child(title).children(this.renderQuotaRows(accounts));
+    }
+    const cards = accounts.filter((account) => account.error === "");
+    const errored = accounts.filter((account) => account.error !== "");
+    const rows = [];
+    for (let i = 0; i < cards.length; i += 2) {
+      rows.push(h_flex().flex_none().w_full().gap(8).items_start()
+        .child(this.renderQuotaCard(cards[i]))
+        .child(i + 1 < cards.length ? this.renderQuotaCard(cards[i + 1]) : div().flex_1()));
+    }
+    return v_flex().flex_none().px(10).pt(8)
+      .child(title)
+      .when(rows.length > 0, (e) => e.child(v_flex().flex_none().w_full().gap(8).children(rows)))
+      .when(errored.length > 0, (e) => e.child(this.renderQuotaErrors(errored)));
+  }
+
+  /** @param {QuotaAccount} account */
+  renderQuotaCard(account) {
+    const t = theme();
+    const head = [account.plan, account.user].filter((part) => part !== "").join(" · ");
+    return v_flex().id(`magpie-quota-card-${account.id}`).flex_1().min_w(0).gap(3).p(8)
+      .rounded(8).border_1().border_color(t.border).bg(t.raised)
+      .tooltip(quotaTooltip(account))
+      .child(div().font_medium().truncate().text_color(t.foreground).child(account.name))
+      .when(head !== "", (e) => e.child(div().text_size(10).text_color(t.dim).truncate().child(head)))
+      .children(account.windows.map((window) => this.renderQuotaWindowLine(window)))
+      .when(account.balance !== "", (e) => e.child(div().text_size(10).text_color(t.muted).child(account.balance)));
+  }
+
+  /** @param {QuotaWindow} window */
+  renderQuotaWindowLine(window) {
+    const t = theme();
+    const remaining = window.unlimited || window.remaining === null ? 100 : window.remaining;
+    const color = window.unlimited || window.remaining === null ? t.muted
+      : window.remaining < 10 ? t.blocked
+      : window.remaining < 30 ? t.idle
+      : t.muted;
+    const reset = window.resetsAt === "" ? "" : `resets ${formatIsoTime(window.resetsAt)}`;
+    return v_flex().flex_none().w_full().gap(2).pb(2)
+      .child(h_flex().w_full().gap(6).items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(t.muted).child(window.name))
+        .child(div().flex_none().text_size(10).text_color(color)
+          .child(window.unlimited ? "unlimited" : formatQuotaPercent(remaining)))
+        .when(reset !== "", (e) => e.child(div().flex_none().text_size(9).text_color(t.dim).child(reset))))
+      .child(div().h(3).w_full().rounded(2).bg(t.hover).overflow_hidden()
+        .child(div().h_full().rounded(2).bg(t.accent).opacity(0.7)
+          .w(`${Math.max(1.5, Math.min(100, remaining)).toFixed(1)}%`)));
+  }
+
+  /**
+   * The compact rows narrow keeps: the accounts nearest their limit, the
+   * unlimited ones, then balances and any refused account.
+   *
+   * @param {QuotaAccount[]} accounts
+   */
+  renderQuotaRows(accounts) {
+    const t = theme();
     const limited = limitedAccounts(accounts);
     const unlimited = unlimitedAccounts(accounts);
     const balances = balanceAccounts(accounts);
     const errored = accounts.filter((account) => account.error !== "");
     const rows = [...limited, ...unlimited].slice(0, QUOTA_LIMIT);
     const hidden = limited.length + unlimited.length - rows.length;
-    return v_flex().flex_none().px(10).pt(8)
-      .child(div().pb(2).text_size(11).font_medium().text_color(t.dim)
-        .when(quota.kind === "stale", (e) => e.tooltip(problemCopy(quota.problem).body))
-        .child(quota.kind === "stale" ? "Quota · stale" : "Quota"))
-      .children(rows.map((account) => {
-        const color = account.pressure === null ? t.muted
-          : account.pressure < 10 ? t.blocked
-          : account.pressure < 30 ? t.idle
-          : t.muted;
-        return h_flex().id(`magpie-quota-${account.id}`).h(18).gap(6).items_center()
-          .tooltip(quotaTooltip(account))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(account.name))
-          .child(div().flex_none().text_size(11).text_color(color).child(quotaValue(account)));
-      }))
-      .when(hidden > 0, (e) => e
-        .child(div().text_size(11).text_color(t.dim).child(`+ ${hidden} more`)))
-      .when(balances.length > 0, (e) => e
-        .child(h_flex().id("magpie-quota-balances").h(18).gap(6).items_center().text_size(11)
-          .tooltip(balances.map((account) => `${account.name}${account.user === "" ? "" : ` · ${account.user}`}: ${account.balance}`).join("\n"))
-          .child(div().flex_none().text_color(t.dim).child("Balance"))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.muted)
-            .child(balances.map((account) => account.user === "" ? account.balance : `${account.user} ${account.balance}`).join(" · ")))))
-      .when(errored.length > 0, (e) => e
-        .child(h_flex().id("magpie-quota-error").h(18).gap(6).items_center().text_size(11)
-          .tooltip(errored.map((account) => `${account.name}: ${account.error}`).join("\n"))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.blocked).child(`${errored[0].name} · ${errored[0].error}`))
-          .when(errored.length > 1, (x) => x.child(div().flex_none().text_color(t.dim).child(`+ ${errored.length - 1}`)))));
+    const lines = rows.map((account) => {
+      const color = account.pressure === null ? t.muted
+        : account.pressure < 10 ? t.blocked
+        : account.pressure < 30 ? t.idle
+        : t.muted;
+      return h_flex().id(`magpie-quota-${account.id}`).h(18).gap(6).items_center()
+        .tooltip(quotaTooltip(account))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(account.name))
+        .child(div().flex_none().text_size(11).text_color(color).child(quotaValue(account)));
+    });
+    if (hidden > 0) {
+      lines.push(div().text_size(11).text_color(t.dim).child(`+ ${hidden} more`));
+    }
+    if (balances.length > 0) {
+      lines.push(h_flex().id("magpie-quota-balances").h(18).gap(6).items_center().text_size(11)
+        .tooltip(balances.map((account) => `${account.name}${account.user === "" ? "" : ` · ${account.user}`}: ${account.balance}`).join("\n"))
+        .child(div().flex_none().text_color(t.dim).child("Balance"))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted)
+          .child(balances.map((account) => account.user === "" ? account.balance : `${account.user} ${account.balance}`).join(" · "))));
+    }
+    if (errored.length > 0) lines.push(this.renderQuotaErrors(errored));
+    return lines;
+  }
+
+  /** @param {QuotaAccount[]} errored */
+  renderQuotaErrors(errored) {
+    const t = theme();
+    return h_flex().id("magpie-quota-error").flex_none().w_full().h(18).gap(6).items_center().text_size(11)
+      .tooltip(errored.map((account) => `${account.name}: ${account.error}`).join("\n"))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.blocked).child(`${errored[0].name} · ${errored[0].error}`))
+      .when(errored.length > 1, (e) => e.child(div().flex_none().text_color(t.dim).child(`+ ${errored.length - 1}`)));
   }
 
   /**
-   * Render at most CHART_LIMIT flex-sized bars. One maximum over the shown
-   * bars; zero calls gets height zero; a nonzero bar is at least 2px. No SVG,
-   * canvas, or animation timer.
+   * One titled list. Rows keep the server's order and open nothing.
    *
-   * @param {Chart} chart
+   * @param {string} title
+   * @param {string} slug
+   * @param {UsageRow[]} rows
+   * @param {"narrow" | "medium" | "wide"} tier
    */
-  renderChart(chart) {
+  renderRows(title, slug, rows, tier) {
     const t = theme();
-    const max = chart.bars.reduce((m, bar) => Math.max(m, bar.calls), 0);
-    const height = (calls) => calls <= 0 ? 0 : Math.max(2, Math.round((calls / (max || 1)) * 28));
-    const by = { hour: "hour", day: "day", week: "week" }[chart.bucket];
-    return v_flex().flex_none().px(10).pt(8)
-      .child(h_flex().id("magpie-chart").w_full().h(32).items_end().gap(1)
-        .when(chart.bars.length === 0 || max === 0, (e) => e.items_center().justify_center().text_size(11).text_color(t.dim).child("No calls in this period"))
-        .children(chart.bars.map((bar) => {
-          const tooltip = [bar.label, `${formatInt(bar.calls)} calls`, `${formatInt(bar.errors)} errors`, formatCost(bar.cost)].join("\n");
-          return div().id(`magpie-bar-${bar.key}`).flex_1().min_w(0).h(32).flex().items_end()
-            .when(height(bar.calls) > 0, (e) => e.child(div().w_full().h(height(bar.calls)).flex_none().rounded(1).bg(t.accent)))
-            .tooltip(tooltip);
-        })))
-      .when(chart.truncated, (e) => e.child(div().text_size(11).text_color(t.dim).child(`Calls by ${by} · last ${CHART_LIMIT}`)));
+    return v_flex().flex_none().w_full().px(10).pt(8)
+      .child(div().pb(4).text_size(11).font_medium().text_color(t.dim).child(title))
+      .children(rows.map((row, i) => this.renderRow(slug, i, row, tier)));
   }
 
   /**
-   * Render one titled share section. Rows preserve parse order and have no
-   * click handler; `+ N more` appears only when rows were actually omitted.
+   * One usage row. Medium and wide put a wrapped sub-line under the name
+   * beside the share bar, the tokens and the cost; narrow stacks the name and
+   * cost over the sub-line, the bar and the token count.
    *
-   * @param {"Agents" | "Models"} title
-   * @param {ShareList} list
+   * @param {string} slug
+   * @param {number} index
+   * @param {UsageRow} row
+   * @param {"narrow" | "medium" | "wide"} tier
    */
-  renderShareSection(title, list) {
+  renderRow(slug, index, row, tier) {
     const t = theme();
-    return v_flex().flex_none().px(10).pt(8)
-      .child(div().pb(2).text_size(11).font_medium().text_color(t.dim).child(title))
-      .children(list.rows.map((row) => {
-        const percent = formatPercent(row.share);
-        const tooltip = [
-          row.name + (row.detail ? ` (${row.detail})` : ""),
-          `${formatInt(row.calls)} calls · ${formatInt(row.errors)} errors`,
-          formatCost(row.cost),
-          `${formatTokens(row.tokens)} tokens (${formatInt(row.tokens)})`,
-          `Share of period tokens ${percent}`,
-        ].join("\n");
-        return h_flex().id(`magpie-${title.toLowerCase()}-${row.id}`).h(18).gap(6).items_center()
-          .tooltip(tooltip)
-          .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(row.name))
-          .child(div().flex_none().text_size(11).text_color(t.muted).child(formatTokens(row.tokens)))
-          .child(div().flex_none().w(34).text_right().text_size(11).text_color(t.dim).child(percent));
-      }))
-      .when(list.totalCount > list.rows.length, (e) => e.child(div().text_size(11).text_color(t.dim).child(`+ ${list.totalCount - list.rows.length} more`)));
+    const sub = rowSubLine(row);
+    const tooltip = rowTooltip(row);
+    if (tier === "narrow") {
+      return v_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(4).gap(2).tooltip(tooltip)
+        .child(h_flex().w_full().gap(6).items_center()
+          .child(div().flex_1().min_w(0).truncate().child(row.name))
+          .child(div().flex_none().text_size(11).text_color(t.ansi2).child(formatCost(row.cost))))
+        .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.muted).whitespace_normal().child(sub)))
+        .child(h_flex().w_full().gap(6).items_center()
+          .child(this.renderShareBar(row, 2, null))
+          .child(div().flex_none().text_size(10).text_color(t.muted).child(formatTokens(row.tokens))));
+    }
+    return h_flex().id(`magpie-${slug}-${index}`).flex_none().w_full().py(4).gap(8).items_center().tooltip(tooltip)
+      .child(v_flex().flex_1().min_w(0)
+        .child(div().truncate().child(row.name))
+        .when(sub !== "", (e) => e.child(div().text_size(10).text_color(t.muted).whitespace_normal().child(sub))))
+      .child(this.renderShareBar(row, 4, 48))
+      .child(v_flex().flex_none().items_end()
+        .child(div().text_size(11).child(formatTokens(row.tokens)))
+        .child(div().text_size(10).text_color(t.dim).child(tokenBreakdown(row))))
+      .child(div().flex_none().w(52).text_right().text_size(11).text_color(t.ansi2).child(formatCost(row.cost)));
   }
+
+  /**
+   * @param {UsageRow} row
+   * @param {number} height
+   * @param {number | null} width null fills the row
+   */
+  renderShareBar(row, height, width) {
+    const t = theme();
+    const bar = v_flex().h(height).rounded(height / 2).bg(t.hover).overflow_hidden()
+      .when(row.share > 0, (e) => e.child(div().h_full().rounded(height / 2).bg(t.accent).opacity(0.7)
+        .w(`${Math.max(1.5, Math.min(100, row.share * 100)).toFixed(1)}%`)));
+    return width === null ? bar.flex_1().min_w(0) : bar.flex_none().w(width);
+  }
+}
+
+/**
+ * The part list under a row's name, in the page's order: the provider, its
+ * calls, failures, cancels, the mean first token, the decode speed, and the
+ * calls magpie made by itself. A zero part is left out.
+ *
+ * @param {UsageRow} row
+ */
+function rowSubLine(row) {
+  const parts = [];
+  if (row.detail !== "") parts.push(row.detail);
+  if (row.calls > 0) parts.push(`${formatInt(row.calls)} ${row.calls === 1 ? "call" : "calls"}`);
+  if (row.errors > 0) parts.push(`${formatInt(row.errors)} failed`);
+  if (row.loops > 0) parts.push(`${formatInt(row.loops)} looped`);
+  if (row.retried > 0) parts.push(`${formatInt(row.retried)} retried`);
+  if (row.canceled > 0) parts.push(`${formatInt(row.canceled)} canceled`);
+  if (row.timed > 0) parts.push(`TTFT ${formatTook(row.ttftMs / row.timed)}`);
+  if (row.decodeMs > 0 && row.decodeOut > 0) parts.push(`${formatInt((row.decodeOut / row.decodeMs) * 1000)} tok/s`);
+  if (row.ownCalls > 0) parts.push(`${formatInt(row.ownCalls)} by magpie itself`);
+  return parts.join(" · ");
+}
+
+/** @param {UsageRow} row */
+function tokenBreakdown(row) {
+  const parts = [`${formatTokens(row.input)} in`, `${formatTokens(row.output)} out`];
+  if (row.cacheRead > 0) parts.push(`${formatTokens(row.cacheRead)} cached`);
+  return parts.join(" · ");
+}
+
+/** @param {UsageRow} row */
+function rowTooltip(row) {
+  const lines = [row.detail === "" ? row.name : `${row.name} · ${row.detail}`];
+  lines.push(`${formatInt(row.calls)} ${row.calls === 1 ? "call" : "calls"} · ${formatInt(row.errors)} failed · ${formatInt(row.canceled)} canceled`);
+  if (row.loops > 0) lines.push(`${formatInt(row.loops)} looped`);
+  if (row.retried > 0) lines.push(`${formatInt(row.retried)} answered on a retry`);
+  if (row.timed > 0) lines.push(`First token ${formatTook(row.ttftMs / row.timed)} on average over ${formatInt(row.timed)} timed replies`);
+  if (row.decodeMs > 0 && row.decodeOut > 0) {
+    const speed = `${formatInt((row.decodeOut / row.decodeMs) * 1000)} tok/s`;
+    lines.push(row.decodeN > 0 ? `${speed} over ${formatInt(row.decodeN)} replies` : speed);
+  }
+  lines.push(`${formatInt(row.tokens)} tokens (${formatInt(row.input)} in · ${formatInt(row.output)} out)`);
+  if (row.cacheRead > 0 || row.cacheWrite > 0) {
+    lines.push(`${formatInt(row.cacheRead)} cache read · ${formatInt(row.cacheWrite)} cache written`);
+  }
+  if (row.reasoning > 0) lines.push(`${formatInt(row.reasoning)} reasoning inside output`);
+  if (row.unpriced > 0) lines.push(`${formatInt(row.unpriced)} unpriced`);
+  lines.push(`${formatCost(row.cost)} · ${formatPercent(row.share)} of the period's tokens`);
+  if (row.ownCalls > 0) lines.push(`${formatInt(row.ownCalls)} of these calls magpie made by itself`);
+  return lines.join("\n");
+}
+
+/**
+ * @param {ChartPoint} point
+ * @param {"hour" | "day" | "week"} bucket
+ */
+function pointTooltip(point, bucket) {
+  const when = bucket === "hour" ? `${point.label}:00` : bucket === "week" ? `week of ${point.label}` : point.label;
+  const tokens = point.input + point.output;
+  if (point.calls === 0 && tokens === 0) return `${when} · nothing`;
+  const lines = [when, `${formatInt(tokens)} tokens`, `${formatInt(point.calls)} ${point.calls === 1 ? "call" : "calls"}`];
+  if (point.cost > 0) lines.push(formatCost(point.cost));
+  return lines.join("\n");
 }
 
 /**
