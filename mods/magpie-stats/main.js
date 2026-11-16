@@ -1,11 +1,16 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home, appHome, readTextFile, writeTextFile, theme } from "herdr";
+import { URL } from "url";
 
 const REFRESH_MS = 30_000;
 const CHART_LIMIT = 30;
 const AGENT_LIMIT = 2;
 const MODEL_LIMIT = 3;
+const QUOTA_LIMIT = 4;
+// A tab is much wider than the sidebar this was designed for; a centered
+// column keeps rows and the chart readable.
+const WIDE_MAX = 560;
 
 // The watch list is shared by every docked copy through one file under the
 // app home, written with compare-and-swap. The default instance is derived,
@@ -26,12 +31,12 @@ const PERIODS = /** @type {const} */ ([
 /** @typedef {{kind: ProblemKind, detail: string}} Problem */
 
 /** @typedef {"default" | `i-${string}`} InstanceId */
-/** @typedef {{id: InstanceId, name: string, addressFile: string}} GatewayInstance */
+/** @typedef {{id: InstanceId, name: string, kind: "file", addressFile: string} | {id: InstanceId, name: string, kind: "key", url: string, key: string}} GatewayInstance */
 /** @typedef {{additional: GatewayInstance[]}} InstanceRegistry */
 /** @typedef {{kind: "add", instance: GatewayInstance} | {kind: "remove", id: InstanceId}} RegistryChange */
 /** @typedef {"bad-registry" | "registry-io" | "invalid-instance"} RegistryProblemKind */
 /** @typedef {{kind: RegistryProblemKind, detail: string}} RegistryProblem */
-/** @typedef {{states: Map<Period, PeriodState>, inFlight: Set<Period>}} InstanceRuntime */
+/** @typedef {{states: Map<Period, PeriodState>, inFlight: Set<Period>, quota: QuotaState, quotaInFlight: boolean}} InstanceRuntime */
 
 /**
  * @typedef {{
@@ -74,6 +79,34 @@ const PERIODS = /** @type {const} */ ([
  *   | {kind: "unavailable", problem: Problem}} PeriodState
  */
 
+/**
+ * @typedef {{
+ *   name: string, used: number | null, remaining: number | null,
+ *   unlimited: boolean, display: string, unit: string,
+ *   balance: number | null, resetsAt: string
+ * }} QuotaWindow
+ */
+
+/**
+ * `pressure` is the lowest remaining among finite, limited windows; `worst`
+ * holds it.
+ * @typedef {{
+ *   id: string, provider: string, name: string, kind: string,
+ *   plan: string, user: string, balance: string, error: string,
+ *   windows: QuotaWindow[], pressure: number | null, worst: QuotaWindow | null,
+ *   readAt: string
+ * }} QuotaAccount
+ */
+
+/** @typedef {{receivedAt: number, accounts: QuotaAccount[]}} QuotaSnapshot */
+
+/**
+ * @typedef {{kind: "loading"}
+ *   | {kind: "ready", snapshot: QuotaSnapshot}
+ *   | {kind: "stale", snapshot: QuotaSnapshot, problem: Problem}
+ *   | {kind: "unavailable", problem: Problem}} QuotaState
+ */
+
 /** Return `totals.input + totals.output`. @param {Totals} totals */
 function nonCacheTokens(totals) {
   return totals.input + totals.output;
@@ -102,7 +135,7 @@ function expandTilde(path) {
  * @returns {GatewayInstance}
  */
 function defaultInstance() {
-  return { id: "default", name: "Magpie", addressFile: `${home()}/.config/magpie/gateway.json` };
+  return { id: "default", name: "Magpie", kind: "file", addressFile: `${home()}/.config/magpie/gateway.json` };
 }
 
 /**
@@ -115,12 +148,6 @@ function newInstanceId() {
 }
 
 /**
- * Validate raw registry JSON. A null or absent file is an empty watch list;
- * junk never clamps into an entry — every problem throws "bad-registry".
- * Names and ids are unique (names case-folded); no entry may claim the
- * default id; address files must be absolute and inside the user's home
- * after `~` expansion.
- *
  * @param {string | null} text
  * @returns {InstanceRegistry}
  */
@@ -144,7 +171,7 @@ function parseRegistry(text) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw bad("bad-registry", "a gateway list entry is not an object");
     }
-    const { id, name, addressFile } = entry;
+    const { id, name } = entry;
     if (typeof id !== "string" || !id.startsWith("i-")) {
       throw bad("bad-registry", `a gateway list entry has an invalid id "${String(id)}"`);
     }
@@ -155,35 +182,60 @@ function parseRegistry(text) {
     }
     const folded = trimmed.toLowerCase();
     if (names.has(folded)) throw bad("bad-registry", `two gateways are named "${trimmed}"`);
-    if (typeof addressFile !== "string" || addressFile === "") {
-      throw bad("bad-registry", `gateway "${trimmed}" has no address file`);
-    }
-    const absolute = expandTilde(addressFile);
-    if (!isAbsolutePath(absolute)) {
-      throw bad("bad-registry", `gateway "${trimmed}" has a relative address file`);
-    }
-    if (!isUnderHome(absolute)) {
-      throw bad("bad-registry", `gateway "${trimmed}" has an address file outside your home`);
+    const kind = entry.kind === undefined ? "file" : entry.kind;
+    if (kind === "file") {
+      const { addressFile } = entry;
+      if (typeof addressFile !== "string" || addressFile === "") {
+        throw bad("bad-registry", `gateway "${trimmed}" has no address file`);
+      }
+      const absolute = expandTilde(addressFile);
+      if (!isAbsolutePath(absolute)) {
+        throw bad("bad-registry", `gateway "${trimmed}" has a relative address file`);
+      }
+      if (!isUnderHome(absolute)) {
+        throw bad("bad-registry", `gateway "${trimmed}" has an address file outside your home`);
+      }
+      additional.push({ id, name: trimmed, kind: "file", addressFile: absolute });
+    } else if (kind === "key") {
+      if (typeof entry.url !== "string" || typeof entry.key !== "string") {
+        throw bad("bad-registry", `gateway "${trimmed}" needs a URL and an API key`);
+      }
+      try {
+        const fields = keyFields(entry.url, entry.key);
+        additional.push({ id, name: trimmed, kind: "key", url: fields.url, key: fields.key });
+      } catch (error) {
+        const detail = typeof error === "object" && error !== null && "detail" in error
+          ? String(/** @type {any} */ (error).detail)
+          : "its URL or API key is invalid";
+        throw bad("bad-registry", `gateway "${trimmed}": ${detail}`);
+      }
+    } else {
+      throw bad("bad-registry", `gateway "${trimmed}" has an unknown kind`);
     }
     ids.add(id);
     names.add(folded);
-    additional.push({ id, name: trimmed, addressFile: absolute });
   }
   return { additional };
 }
 
 /**
- * Validate an add-form draft. Throws "invalid-instance" naming the field.
- *
+ * @param {string} name
+ */
+function draftName(name) {
+  const trimmed = name.trim();
+  if (trimmed.length < 1 || trimmed.length > 24) {
+    throw bad("invalid-instance", "name: give it a name of 1 to 24 characters");
+  }
+  return trimmed;
+}
+
+/**
  * @param {string} name
  * @param {string} addressFile
  * @returns {GatewayInstance}
  */
 function parseInstanceDraft(name, addressFile) {
-  const trimmed = name.trim();
-  if (trimmed.length < 1 || trimmed.length > 24) {
-    throw bad("invalid-instance", "name: give it a name of 1 to 24 characters");
-  }
+  const trimmed = draftName(name);
   const raw = addressFile.trim();
   if (raw === "") throw bad("invalid-instance", "address file: give the path to its gateway.json");
   const absolute = expandTilde(raw);
@@ -193,7 +245,58 @@ function parseInstanceDraft(name, addressFile) {
   if (!isUnderHome(absolute)) {
     throw bad("invalid-instance", "address file: it must live inside your home directory");
   }
-  return { id: newInstanceId(), name: trimmed, addressFile: absolute };
+  return { id: newInstanceId(), name: trimmed, kind: "file", addressFile: absolute };
+}
+
+/**
+ * Neither the key nor the raw URL appears in an error.
+ *
+ * @param {string} urlText
+ * @param {string} keyText
+ * @returns {{url: string, key: string}}
+ */
+function keyFields(urlText, keyText) {
+  const rawUrl = urlText.trim();
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw bad("invalid-instance", "url: give an http or https URL such as http://127.0.0.1:3425");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw bad("invalid-instance", "url: use an http or https URL");
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw bad("invalid-instance", "url: remove the username and password");
+  }
+  if (parsed.hostname === "") throw bad("invalid-instance", "url: give it a host");
+  if (parsed.pathname !== "" && parsed.pathname !== "/") {
+    throw bad("invalid-instance", "url: use the origin only, with no path");
+  }
+  if (rawUrl.includes("?") || rawUrl.includes("#") || parsed.search !== "" || parsed.hash !== "") {
+    throw bad("invalid-instance", "url: remove the query and fragment");
+  }
+  const key = keyText.trim();
+  if (key === "") throw bad("invalid-instance", "api key: give the gateway's API key");
+  for (const char of key) {
+    const code = char.charCodeAt(0);
+    if (code < 0x21 || code > 0x7e) {
+      throw bad("invalid-instance", "api key: use printable ASCII characters with no spaces");
+    }
+  }
+  return { url: parsed.origin, key };
+}
+
+/**
+ * @param {string} name
+ * @param {string} url
+ * @param {string} key
+ * @returns {GatewayInstance}
+ */
+function parseKeyInstanceDraft(name, url, key) {
+  const trimmed = draftName(name);
+  const fields = keyFields(url, key);
+  return { id: newInstanceId(), name: trimmed, kind: "key", url: fields.url, key: fields.key };
 }
 
 /**
@@ -212,17 +315,24 @@ function applyRegistryChange(registry, change) {
     return { additional: registry.additional.filter((entry) => entry.id !== change.id) };
   }
   const { instance } = change;
-  if (registry.additional.some((entry) =>
-    entry.id === instance.id && entry.name === instance.name && entry.addressFile === instance.addressFile)) {
-    return registry;
+  // Stored in explicit form, so a replay compares equal to the parsed entry
+  // and a second write of the same entry is a no-op.
+  const stored = instance.kind === "key"
+    ? instance
+    : { id: instance.id, name: instance.name, kind: "file", addressFile: instance.addressFile };
+  const duplicate = stored.kind === "key"
+    ? (entry) => entry.kind === "key" && entry.id === stored.id && entry.name === stored.name &&
+        entry.url === stored.url && entry.key === stored.key
+    : (entry) => entry.kind === "file" && entry.id === stored.id && entry.name === stored.name &&
+        entry.addressFile === stored.addressFile;
+  if (registry.additional.some(duplicate)) return registry;
+  if (registry.additional.some((entry) => entry.id === stored.id)) {
+    throw bad("invalid-instance", `id "${stored.id}" is already in the gateway list`);
   }
-  if (registry.additional.some((entry) => entry.id === instance.id)) {
-    throw bad("invalid-instance", `id "${instance.id}" is already in the gateway list`);
+  if (registry.additional.some((entry) => entry.name.toLowerCase() === stored.name.toLowerCase())) {
+    throw bad("invalid-instance", `a gateway named "${stored.name}" already exists`);
   }
-  if (registry.additional.some((entry) => entry.name.toLowerCase() === instance.name.toLowerCase())) {
-    throw bad("invalid-instance", `a gateway named "${instance.name}" already exists`);
-  }
-  return { additional: [...registry.additional, instance] };
+  return { additional: [...registry.additional, stored] };
 }
 
 /** @param {string} path */
@@ -335,15 +445,17 @@ function gatewayOrigin(text) {
 }
 
 /**
- * Read and validate one period of one instance at the system boundary.
- * See the checks in order below; the instance's address file is re-read
- * every call so a gateway restart on a new port needs no mod restart.
+ * A file instance re-reads its address file on every request, so a port
+ * change heals without a reload. A key instance puts the key in the request
+ * header only.
  *
  * @param {GatewayInstance} instance
- * @param {Period} period
- * @returns {Promise<UsageSnapshot>}
+ * @returns {Promise<{origin: string, headers: Record<string, string> | undefined}>}
  */
-async function loadUsage(instance, period) {
+async function resolveGateway(instance) {
+  if (instance.kind === "key") {
+    return { origin: instance.url, headers: { Authorization: `Bearer ${instance.key}` } };
+  }
   let text;
   try {
     text = await readTextFile(instance.addressFile);
@@ -352,14 +464,50 @@ async function loadUsage(instance, period) {
     throw bad("unreachable", `cannot read the gateway address file (${message})`);
   }
   if (text === null) throw bad("not-running", "the gateway address file is absent");
-  const origin = gatewayOrigin(text);
-  const url = `${origin}/v1/magpie/usage?period=${period}`;
-  const response = await fetch(url);
-  if (!response.ok || response.url !== url) {
-    // Redirects are followed transparently, so response.url is the only redirect check.
-    throw bad("bad-response", `HTTP ${response.status}`);
+  return { origin: gatewayOrigin(text), headers: undefined };
+}
+
+/**
+ * A redirect is refused because redirects are followed transparently:
+ * response.url is the only evidence of one.
+ *
+ * @param {*} response
+ * @param {string} url
+ * @returns {Problem | null}
+ */
+function responseProblem(response, url) {
+  if (response.status === 401 || response.status === 403) {
+    return bad("bad-response", "the gateway refused the key");
   }
+  if (!response.ok || response.url !== url) return bad("bad-response", `HTTP ${response.status}`);
+  return null;
+}
+
+/**
+ * @param {GatewayInstance} instance
+ * @param {Period} period
+ * @returns {Promise<UsageSnapshot>}
+ */
+async function loadUsage(instance, period) {
+  const { origin, headers } = await resolveGateway(instance);
+  const url = `${origin}/v1/magpie/usage?period=${period}`;
+  const response = await fetch(url, headers ? { headers } : undefined);
+  const problem = responseProblem(response, url);
+  if (problem !== null) throw problem;
   return parseUsage(await response.json(), period, Date.now());
+}
+
+/**
+ * @param {GatewayInstance} instance
+ * @returns {Promise<QuotaSnapshot>}
+ */
+async function loadQuota(instance) {
+  const { origin, headers } = await resolveGateway(instance);
+  const url = `${origin}/v1/magpie/quotas`;
+  const response = await fetch(url, headers ? { headers } : undefined);
+  const problem = responseProblem(response, url);
+  if (problem !== null) throw problem;
+  return parseQuota(await response.json(), Date.now());
 }
 
 function finiteNonnegative(value) {
@@ -457,6 +605,104 @@ function parseShare(raw, periodTokens, fallbacks) {
   };
 }
 
+/** @param {unknown} value */
+function optionalString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+/** @param {unknown} value */
+function optionalFinite(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * @param {unknown} raw
+ * @param {number} receivedAt
+ * @returns {QuotaSnapshot}
+ */
+function parseQuota(raw, receivedAt) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw badResponse("payload is not an object");
+  const obj = /** @type {Record<string, unknown>} */ (raw);
+  if (!Array.isArray(obj.data)) throw badResponse("data is not an array");
+  return {
+    receivedAt,
+    accounts: obj.data.map((entry, index) => parseQuotaAccount(entry, index)),
+  };
+}
+
+/**
+ * @param {unknown} raw
+ * @param {number} index
+ * @returns {QuotaAccount}
+ */
+function parseQuotaAccount(raw, index) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw badResponse("a quota account is not an object");
+  }
+  const obj = /** @type {Record<string, unknown>} */ (raw);
+  for (const name of ["provider", "name", "kind"]) {
+    if (typeof obj[name] !== "string" || obj[name] === "") {
+      throw badResponse(`a quota account has no ${name}`);
+    }
+  }
+  if (!Array.isArray(obj.windows)) throw badResponse(`quota account "${obj.name}" has no windows array`);
+  const provider = /** @type {string} */ (obj.provider);
+  const name = /** @type {string} */ (obj.name);
+  const kind = /** @type {string} */ (obj.kind);
+  const user = optionalString(obj.user);
+  const windows = obj.windows.map((entry) => parseQuotaWindow(entry, name));
+  let pressure = null;
+  let worst = null;
+  for (const window of windows) {
+    if (window.unlimited || window.remaining === null) continue;
+    if (pressure === null || window.remaining < pressure) {
+      pressure = window.remaining;
+      worst = window;
+    }
+  }
+  return {
+    id: `${provider}:${user}:${index}`,
+    provider, name, kind,
+    plan: optionalString(obj.plan),
+    user,
+    balance: optionalString(obj.balance),
+    error: optionalString(obj.error),
+    windows, pressure, worst,
+    readAt: optionalString(obj.readAt),
+  };
+}
+
+/**
+ * @param {unknown} raw
+ * @param {string} account
+ * @returns {QuotaWindow}
+ */
+function parseQuotaWindow(raw, account) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw badResponse("a quota window is not an object");
+  }
+  const obj = /** @type {Record<string, unknown>} */ (raw);
+  if (typeof obj.name !== "string" || obj.name === "") {
+    throw badResponse(`quota account "${account}" has a window with no name`);
+  }
+  const name = /** @type {string} */ (obj.name);
+  const unlimited = obj.unlimited === true;
+  const remaining = optionalFinite(obj.remaining);
+  if (!unlimited && (remaining === null || remaining < 0 || remaining > 100)) {
+    throw badResponse(`quota window "${name}" has no usable remaining value`);
+  }
+  return {
+    name,
+    used: optionalFinite(obj.used),
+    remaining,
+    unlimited,
+    display: optionalString(obj.display),
+    unit: optionalString(obj.unit),
+    balance: optionalFinite(obj.balance),
+    resetsAt: optionalString(obj.resetsAt),
+  };
+}
+
 /**
  * Preserve a known Problem kind and a short detail. An ordinary fetch rejection
  * becomes "unreachable". Never includes a response body, stack, or payload.
@@ -548,6 +794,77 @@ function formatTime(receivedAt) {
   return `${two(d.getHours())}:${two(d.getMinutes())}`;
 }
 
+/**
+ * Date.parse is unreliable for nanosecond fractions here, so split the
+ * fields by hand.
+ *
+ * @param {string} text
+ */
+function formatIsoTime(text) {
+  if (text === "") return "";
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(text);
+  if (match === null) return text;
+  const [, year, month, day, hour, minute, second, zone] = match;
+  if (zone === undefined) return `${hour}:${minute}`;
+  let offset = 0;
+  if (zone !== "Z") {
+    const sign = zone.startsWith("-") ? -1 : 1;
+    const digits = zone.slice(1).replace(":", "");
+    offset = sign * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2)));
+  }
+  const utc = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), second === undefined ? 0 : Number(second));
+  return formatTime(utc - offset * 60_000);
+}
+
+/** @param {number} value */
+function formatQuotaPercent(value) {
+  const fixed = value.toFixed(1);
+  return `${fixed.endsWith(".0") ? fixed.slice(0, -2) : fixed}%`;
+}
+
+/** @param {QuotaAccount} account */
+function quotaValue(account) {
+  return account.pressure === null ? "unlimited" : formatQuotaPercent(account.pressure);
+}
+
+/** @param {QuotaAccount[]} accounts */
+function limitedAccounts(accounts) {
+  return accounts
+    .filter((account) => account.error === "" && account.pressure !== null)
+    .sort((a, b) => (a.pressure ?? 0) - (b.pressure ?? 0));
+}
+
+/** @param {QuotaAccount[]} accounts */
+function unlimitedAccounts(accounts) {
+  return accounts.filter((account) => account.error === "" && account.pressure === null && account.windows.length > 0);
+}
+
+/** @param {QuotaAccount[]} accounts */
+function balanceAccounts(accounts) {
+  return accounts.filter((account) => account.error === "" && account.windows.length === 0 && account.balance !== "");
+}
+
+/** @param {QuotaAccount} account */
+function quotaTooltip(account) {
+  const lines = [account.name];
+  if (account.plan !== "") lines.push(`Plan ${account.plan}`);
+  if (account.user !== "") lines.push(`User ${account.user}`);
+  for (const window of account.windows) {
+    const amount = window.display !== ""
+      ? window.display
+      : window.unlimited
+        ? "unlimited"
+        : window.remaining !== null
+          ? formatQuotaPercent(window.remaining)
+          : "";
+    const reset = window.resetsAt !== "" ? ` · resets ${formatIsoTime(window.resetsAt)}` : "";
+    lines.push(amount === "" ? `${window.name}${reset}` : `${window.name} · ${amount}${reset}`);
+  }
+  if (account.readAt !== "") lines.push(`Read at ${formatIsoTime(account.readAt)}`);
+  if (account.error !== "") lines.push(account.error);
+  return lines.join("\n");
+}
+
 export default class MagpieStats extends View {
   init(_props, cx) {
     /** @type {InstanceRegistry} */
@@ -574,10 +891,16 @@ export default class MagpieStats extends View {
     /** @type {RegistryProblem | null} */
     this.addProblem = null;
 
-    // InputState needs a live host call, so both add-form states are made
-    // once here and only re-filled when the form opens.
+    /** @type {"file" | "key"} */
+    this.addKind = "file";
+
+    // InputState needs a live host call, so the add-form states are made once
+    // here and only re-filled when the form opens.
     this.nameState = InputState.new();
     this.pathState = InputState.new();
+    this.urlState = InputState.new();
+    this.keyState = InputState.new();
+    this.keyState.set_masked(true);
 
     /** @type {number} */
     this.width = 240;
@@ -610,15 +933,13 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * Find or create the runtime that owns one instance's states and inFlight.
-   * Creating it here keeps every later capture one object reference.
    *
    * @param {InstanceId} id
    */
   runtimeFor(id) {
     let runtime = this.runtimes.get(id);
     if (runtime === undefined) {
-      runtime = { states: new Map(), inFlight: new Set() };
+      runtime = { states: new Map(), inFlight: new Set(), quota: { kind: "loading" }, quotaInFlight: false };
       this.runtimes.set(id, runtime);
     }
     return runtime;
@@ -672,14 +993,13 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * Refresh the selected instance, and every listed one while the picker is
-   * open. Never writes a state itself; each refresh owns its own runtime.
    *
    * @param {import("gpui-kit").Context} cx
    */
   refreshVisible(cx) {
     for (const instance of this.instances()) {
       this.refresh(cx, instance, this.periodFor(instance.id), false);
+      this.refreshQuota(cx, instance, false);
     }
   }
 
@@ -706,7 +1026,9 @@ export default class MagpieStats extends View {
     this.selectedInstanceId = id;
     localStorage.setItem(SELECTED_INSTANCE_KEY, id);
     cx.notify();
-    this.refresh(cx, this.selectedInstance(), this.selectedPeriod(), false);
+    const instance = this.selectedInstance();
+    this.refresh(cx, instance, this.selectedPeriod(), false);
+    this.refreshQuota(cx, instance, false);
   }
 
   /**
@@ -767,6 +1089,36 @@ export default class MagpieStats extends View {
   }
 
   /**
+   *
+   * @param {GatewayInstance} instance
+   * @param {boolean} force
+   */
+  refreshQuota(cx, instance, force) {
+    const runtime = this.runtimeFor(instance.id);
+    if (runtime.quotaInFlight) return;
+    const current = runtime.quota;
+    if (!force && current.kind === "ready" && Date.now() - current.snapshot.receivedAt < REFRESH_MS) return;
+    runtime.quotaInFlight = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      let next;
+      try {
+        next = { kind: "ready", snapshot: await loadQuota(instance) };
+      } catch (error) {
+        const problem = asProblem(error);
+        const existing = runtime.quota;
+        next = existing.kind === "ready" || existing.kind === "stale"
+          ? { kind: "stale", snapshot: existing.snapshot, problem }
+          : { kind: "unavailable", problem };
+      } finally {
+        runtime.quota = next;
+        runtime.quotaInFlight = false;
+        cx.notify();
+      }
+    });
+  }
+
+  /**
    * Open or close the picker. Opening re-reads the shared registry so a
    * change made in another docked copy shows at once.
    */
@@ -781,17 +1133,28 @@ export default class MagpieStats extends View {
     }
   }
 
-  /**
-   * Show the add form, prefilled with the next unused gateway number.
-   */
   showAdd(cx) {
     this.picker = "add";
+    this.addKind = "file";
     this.addProblem = null;
     const taken = new Set(this.registry.additional.map((entry) => entry.name.toLowerCase()));
     let n = this.registry.additional.length + 2;
     while (taken.has(`magpie-${n}`)) n++;
     this.nameState.set_value(`magpie-${n}`);
     this.pathState.set_value(`~/.config/magpie/gateway-${n}.json`);
+    this.urlState.set_value("http://127.0.0.1:3425");
+    this.keyState.set_value("");
+    cx.notify();
+  }
+
+  /**
+   *
+   * @param {"file" | "key"} kind
+   */
+  selectAddKind(cx, kind) {
+    if (kind === this.addKind) return;
+    this.addKind = kind;
+    this.addProblem = null;
     cx.notify();
   }
 
@@ -812,7 +1175,10 @@ export default class MagpieStats extends View {
   saveAdd(cx) {
     try {
       this.addProblem = null;
-      const instance = parseInstanceDraft(this.nameState.value(), this.pathState.value());
+      const name = this.nameState.value();
+      const instance = this.addKind === "key"
+        ? parseKeyInstanceDraft(name, this.urlState.value(), this.keyState.value())
+        : parseInstanceDraft(name, this.pathState.value());
       cx.notify();
       cx.spawn(async (cx) => {
         try {
@@ -866,14 +1232,12 @@ export default class MagpieStats extends View {
     const instance = this.selectedInstance();
     const runtime = this.runtimeFor(instance.id);
     const state = runtime.states.get(this.periodFor(instance.id)) ?? { kind: "loading" };
+    const quota = runtime.quota;
     if (this.width < 160) return this.renderRail(instance, state, t);
     const busy = runtime.inFlight.has(this.periodFor(instance.id));
     const status = statusOf(state, t);
-    return v_flex().id("magpie-stats").size_full().min_h(0).overflow_hidden().bg(t.chrome).text_color(t.foreground).text_size(12)
-      .on_size_change((size, cx) => {
-        const width = size.width;
-        if (width !== this.width) { this.width = width; cx.notify(); }
-      })
+    const column = v_flex().min_h(0).h_full().w_full()
+      .when(this.width > WIDE_MAX, (e) => e.max_w(WIDE_MAX))
       .child(h_flex().flex_none().px(10).pt(8).pb(4).gap(6).items_center()
         .child(div().font_semibold().cursor_pointer().tooltip("Switch gateway")
           .hover((s) => s.bg(t.hover)).rounded(5)
@@ -888,7 +1252,10 @@ export default class MagpieStats extends View {
           .when(busy, (e) => e.text_color(t.working).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90))
           .when(!busy, (e) => e.text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover)).child("↻"))
           .tooltip("Refresh now")
-          .on_click((_e, cx) => this.refresh(cx, this.selectedInstance(), this.selectedPeriod(), true))))
+          .on_click((_e, cx) => {
+            this.refresh(cx, this.selectedInstance(), this.selectedPeriod(), true);
+            this.refreshQuota(cx, this.selectedInstance(), true);
+          })))
       .when(this.picker !== "off", (e) => e.child(this.renderPicker(t)))
       .child(h_flex().flex_none().px(10).pb(6).gap(2)
         .children(PERIODS.map((p) => {
@@ -901,7 +1268,14 @@ export default class MagpieStats extends View {
             .on_click((_e, cx) => this.selectPeriod(p.id, cx))
             .child(p.label);
         })))
-      .child(this.renderBody(state, t));
+      .child(this.renderBody(state, quota, t));
+    return v_flex().id("magpie-stats").size_full().min_h(0).overflow_hidden().items_center()
+      .bg(t.chrome).text_color(t.foreground).text_size(12)
+      .on_size_change((size, cx) => {
+        const width = size.width;
+        if (width !== this.width) { this.width = width; cx.notify(); }
+      })
+      .child(column);
   }
 
   /**
@@ -968,21 +1342,44 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * The add form: two labeled fields, the inline problem line, Add and
-   * Cancel. A failure keeps the typed values.
    *
    * @param {*} t
    */
   renderAddForm(t) {
+    const kinds = /** @type {const} */ ([
+      { id: "file", label: "Address file" },
+      { id: "key", label: "URL + key" },
+    ]);
     return v_flex().id("magpie-add").flex_none().px(0).pb(4).gap(6)
+      .child(h_flex().flex_none().gap(2)
+        .children(kinds.map((option) => {
+          const selected = option.id === this.addKind;
+          return div().id(`magpie-add-kind-${option.id}`).flex_1().h(20).flex().items_center().justify_center().rounded(5)
+            .text_size(11).cursor_pointer()
+            .bg(selected ? t.raised : "#00000000")
+            .text_color(selected ? t.foreground : t.muted)
+            .hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => this.selectAddKind(cx, option.id))
+            .child(option.label);
+        })))
       .child(v_flex().flex_none().gap(3)
         .child(div().text_size(11).text_color(t.dim).child("Name"))
         .child(Input.new(this.nameState).h(22).px(6).rounded(5).border_1().border_color(t.border).bg(t.raised)
           .text_size(11).text_color(t.foreground)))
-      .child(v_flex().flex_none().gap(3)
-        .child(div().text_size(11).text_color(t.dim).child("Address file"))
-        .child(Input.new(this.pathState).h(22).px(6).rounded(5).border_1().border_color(t.border).bg(t.raised)
-          .text_size(11).text_color(t.foreground)))
+      .when(this.addKind === "file", (e) => e
+        .child(v_flex().flex_none().gap(3)
+          .child(div().text_size(11).text_color(t.dim).child("Address file"))
+          .child(Input.new(this.pathState).h(22).px(6).rounded(5).border_1().border_color(t.border).bg(t.raised)
+            .text_size(11).text_color(t.foreground))))
+      .when(this.addKind === "key", (e) => e
+        .child(v_flex().flex_none().gap(3)
+          .child(div().text_size(11).text_color(t.dim).child("URL"))
+          .child(Input.new(this.urlState).h(22).px(6).rounded(5).border_1().border_color(t.border).bg(t.raised)
+            .text_size(11).text_color(t.foreground)))
+        .child(v_flex().flex_none().gap(3)
+          .child(div().text_size(11).text_color(t.dim).child("API key"))
+          .child(Input.new(this.keyState).h(22).px(6).rounded(5).border_1().border_color(t.border).bg(t.raised)
+            .text_size(11).text_color(t.foreground))))
       .when(this.addProblem !== null, (e) => e
         .child(div().id("magpie-add-problem").flex_none().text_size(11).text_color(t.blocked)
           .tooltip(this.addProblem?.detail)
@@ -1021,7 +1418,10 @@ export default class MagpieStats extends View {
       })
       .child(v_flex().id("magpie-rail").flex_1().min_h(0).items_center().justify_center().cursor_pointer()
         .text_size(12).font_semibold().text_color(t.muted).tooltip(note)
-        .on_click((_e, cx) => this.refresh(cx, this.selectedInstance(), this.selectedPeriod(), true))
+        .on_click((_e, cx) => {
+          this.refresh(cx, this.selectedInstance(), this.selectedPeriod(), true);
+          this.refreshQuota(cx, this.selectedInstance(), true);
+        })
         .child(h_flex().gap(3).items_center()
           .child(instance.name.slice(0, 1).toUpperCase())
           .child(div().size(5).rounded(3).bg(status.color)))
@@ -1039,8 +1439,9 @@ export default class MagpieStats extends View {
    * footer), one quiet line for loading, problemCopy for unavailable.
    *
    * @param {PeriodState} state
+   * @param {QuotaState} quota
    */
-  renderBody(state, t) {
+  renderBody(state, quota, t) {
     if (state.kind === "loading") {
       return div().flex_1().min_h(0).px(10).pt(8).text_color(t.dim).child("Reading Magpie usage…");
     }
@@ -1050,7 +1451,7 @@ export default class MagpieStats extends View {
         .child(div().font_medium().text_color(t.foreground).child(copy.title))
         .child(div().text_size(11).text_color(t.dim).tooltip(state.problem.detail).child(copy.body));
     }
-    const content = this.renderSnapshot(state.snapshot);
+    const content = this.renderSnapshot(state.snapshot, quota);
     if (state.kind !== "stale") return content;
     return v_flex().flex_1().min_h(0)
       .child(content)
@@ -1060,12 +1461,11 @@ export default class MagpieStats extends View {
   }
 
   /**
-   * Render totals, token details, chart, agents, and models. Wire fields never
-   * appear; everything comes from the validated snapshot.
    *
    * @param {UsageSnapshot} snapshot
+   * @param {QuotaState} quota
    */
-  renderSnapshot(snapshot) {
+  renderSnapshot(snapshot, quota) {
     const t = theme();
     const totals = snapshot.totals;
     const cost = h_flex().flex_none().px(10).pt(6).gap(6).items_end().flex_wrap()
@@ -1091,12 +1491,63 @@ export default class MagpieStats extends View {
           .child(div().child(`${formatTokens(totals.input)} in · ${formatTokens(totals.output)} out`))
           .when(totals.cacheRead > 0, (e) => e.child(div().child(`${formatTokens(totals.cacheRead)} cache read`)))
       : null;
+    const quotaSection = this.renderQuota(quota);
     return v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll()
       .child(cost).child(calls).when(tokens !== null, (e) => e.child(tokens))
+      .when(quotaSection !== null, (e) => e.child(quotaSection))
       .child(this.renderChart(snapshot.chart))
       // One agent at 100% carries no routing information.
       .when(snapshot.agents.totalCount > 1, (e) => e.child(this.renderShareSection("Agents", snapshot.agents)))
       .child(this.renderShareSection("Models", snapshot.models));
+  }
+
+  /**
+   *
+   * @param {QuotaState} quota
+   */
+  renderQuota(quota) {
+    const t = theme();
+    if (quota.kind === "loading") return null;
+    if (quota.kind === "unavailable") {
+      return div().px(10).pt(8).text_size(11).text_color(t.dim)
+        .tooltip(problemCopy(quota.problem).body)
+        .child("Quota unavailable");
+    }
+    const accounts = quota.snapshot.accounts;
+    if (accounts.length === 0) return null;
+    const limited = limitedAccounts(accounts);
+    const unlimited = unlimitedAccounts(accounts);
+    const balances = balanceAccounts(accounts);
+    const errored = accounts.filter((account) => account.error !== "");
+    const rows = [...limited, ...unlimited].slice(0, QUOTA_LIMIT);
+    const hidden = limited.length + unlimited.length - rows.length;
+    return v_flex().flex_none().px(10).pt(8)
+      .child(div().pb(2).text_size(11).font_medium().text_color(t.dim)
+        .when(quota.kind === "stale", (e) => e.tooltip(problemCopy(quota.problem).body))
+        .child(quota.kind === "stale" ? "Quota · stale" : "Quota"))
+      .children(rows.map((account) => {
+        const color = account.pressure === null ? t.muted
+          : account.pressure < 10 ? t.blocked
+          : account.pressure < 30 ? t.idle
+          : t.muted;
+        return h_flex().id(`magpie-quota-${account.id}`).h(18).gap(6).items_center()
+          .tooltip(quotaTooltip(account))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(account.name))
+          .child(div().flex_none().text_size(11).text_color(color).child(quotaValue(account)));
+      }))
+      .when(hidden > 0, (e) => e
+        .child(div().text_size(11).text_color(t.dim).child(`+ ${hidden} more`)))
+      .when(balances.length > 0, (e) => e
+        .child(h_flex().id("magpie-quota-balances").h(18).gap(6).items_center().text_size(11)
+          .tooltip(balances.map((account) => `${account.name}${account.user === "" ? "" : ` · ${account.user}`}: ${account.balance}`).join("\n"))
+          .child(div().flex_none().text_color(t.dim).child("Balance"))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.muted)
+            .child(balances.map((account) => account.user === "" ? account.balance : `${account.user} ${account.balance}`).join(" · ")))))
+      .when(errored.length > 0, (e) => e
+        .child(h_flex().id("magpie-quota-error").h(18).gap(6).items_center().text_size(11)
+          .tooltip(errored.map((account) => `${account.name}: ${account.error}`).join("\n"))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.blocked).child(`${errored[0].name} · ${errored[0].error}`))
+          .when(errored.length > 1, (x) => x.child(div().flex_none().text_color(t.dim).child(`+ ${errored.length - 1}`)))));
   }
 
   /**
