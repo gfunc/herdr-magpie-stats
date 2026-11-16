@@ -13,10 +13,10 @@ const source = readFileSync(modPath, "utf8");
 
 const NAMES = [
   "expandTilde", "defaultInstance", "newInstanceId", "parseRegistry",
-  "parseInstanceDraft", "applyRegistryChange", "isAbsolutePath", "isUnderHome",
+  "draftName", "parseInstanceDraft", "applyRegistryChange", "isAbsolutePath", "isUnderHome",
   "readRegistry", "updateRegistry", "asRegistryProblem", "bad",
 ];
-const EXTRACT = ["bad", "isAbsolutePath", "isUnderHome", "expandTilde", "newInstanceId", "parseRegistry", "parseInstanceDraft", "applyRegistryChange"];
+const EXTRACT = ["bad", "isAbsolutePath", "isUnderHome", "expandTilde", "newInstanceId", "parseRegistry", "draftName", "parseInstanceDraft", "applyRegistryChange"];
 const RUNTIME = ["defaultInstance", "readRegistry", "updateRegistry", "asRegistryProblem"];
 
 for (const name of [...NAMES]) {
