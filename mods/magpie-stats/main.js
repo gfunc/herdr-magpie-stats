@@ -17,14 +17,14 @@ const ICON_FILES = {
   zcode: "zcode.png",
 };
 
-// Rail, narrow, medium and wide, by the panel's own width. The content is one
-// 560 column until it can hold two of them side by side.
+// Rail, narrow, medium and wide, by the panel's own width. The content flows
+// in one column at every size, capped like the page's own view (app.css's
+// #view-usage rule), with the allowance cards side by side inside it.
 const RAIL_WIDTH = 160;
 const NARROW_WIDTH = 420;
 const MEDIUM_WIDTH = 760;
 const COLUMN_WIDTH = 560;
-const COLUMN_GAP = 16;
-const CONTENT_WIDTH = COLUMN_WIDTH * 2 + COLUMN_GAP;
+const PAGE_WIDTH = 1200;
 
 // The watch list is shared by every docked copy through one file under the
 // app home, written with compare-and-swap. The default instance is derived,
@@ -1861,7 +1861,7 @@ export default class MagpieStats extends View {
     const busy = runtime.inFlight.has(this.periodFor(instance.id));
     const status = statusOf(state, t);
     const column = v_flex().min_h(0).h_full().w_full()
-      .max_w(tier === "wide" ? CONTENT_WIDTH : COLUMN_WIDTH)
+      .max_w(tier === "wide" ? PAGE_WIDTH : COLUMN_WIDTH)
       .child(h_flex().flex_none().px(10).pt(8).pb(4).gap(6).items_center()
         .child(div().font_semibold().cursor_pointer().tooltip("Switch gateway")
           .hover((s) => s.bg(t.hover)).rounded(5)
@@ -2109,20 +2109,14 @@ export default class MagpieStats extends View {
     const scroll = v_flex().id("magpie-snapshot").w_full().flex_1().min_h(0).overflow_y_scroll().items_center().bg(p.bg);
 
     const lists = (names) => names.map(([title, slug, rows]) => this.renderRows(title, slug, rows, tier, p));
-    if (tier === "wide") {
-      const left = [cost, allowances, scope, kpis, chart,
-        ...lists([["Agents", "agents", snapshot.agents]])];
-      const right = lists([["Models", "models", snapshot.models], ["Accounts", "accounts", snapshot.accounts], ["Gateway keys", "gateway-keys", snapshot.keys]]);
-      right.push(footer);
-      return scroll.child(h_flex().flex_none().w_full().max_w(CONTENT_WIDTH).gap(COLUMN_GAP).items_start()
-        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(left.filter((x) => x !== null)))
-        .child(v_flex().flex_1().min_w(0).max_w(COLUMN_WIDTH).children(right.filter((x) => x !== null))));
-    }
-
+    // One column, as the page flows: the allowances first, then the tiles,
+    // the chart and the four lists. The content is capped wide, and the
+    // allowance cards and the KPI strip fill it side by side inside.
     const sections = [cost, allowances, scope, kpis, chart,
       ...lists([["Agents", "agents", snapshot.agents], ["Models", "models", snapshot.models], ["Accounts", "accounts", snapshot.accounts], ["Gateway keys", "gateway-keys", snapshot.keys]]),
       footer];
-    return scroll.child(v_flex().flex_none().w_full().max_w(COLUMN_WIDTH).children(sections.filter((x) => x !== null)));
+    const cap = tier === "wide" ? PAGE_WIDTH : COLUMN_WIDTH;
+    return scroll.child(v_flex().flex_none().w_full().max_w(cap).children(sections.filter((x) => x !== null)));
   }
 
   /**
@@ -2255,7 +2249,8 @@ export default class MagpieStats extends View {
         .child(quota.kind === "stale" ? "ALLOWANCES · STALE" : "ALLOWANCES"))
       .child(div().flex_1())
       .when(hasWindows, (e) => e.child(this.renderQuotaMode(p)));
-    const cols = tier === "narrow" ? 1 : Math.max(1, Math.floor((Math.min(this.width, COLUMN_WIDTH) - 20 + 7) / (260 + 7)));
+    const contentW = tier === "wide" ? PAGE_WIDTH : COLUMN_WIDTH;
+    const cols = tier === "narrow" ? 1 : Math.max(1, Math.floor((Math.min(this.width, contentW) - 20 + 7) / (260 + 7)));
     const cards = groups.map((group) => this.renderQuotaCard(group, p));
     if (cols === 1) {
       return v_flex().flex_none().w_full()
@@ -2265,7 +2260,7 @@ export default class MagpieStats extends View {
     // Masonry, as the page packs its cards: each card measured once at this
     // column width, then placed in the shortest column. The estimate stands
     // in until a card's first measurement.
-    const inner = Math.min(this.width, COLUMN_WIDTH) - 20;
+    const inner = Math.min(this.width, contentW) - 20;
     const cardWidth = (inner - (cols - 1) * 7) / cols;
     const signature = `${cols}|${Math.round(cardWidth)}|${this.quotaLeft ? 1 : 0}`;
     if (this.cardPackSignature !== signature) {

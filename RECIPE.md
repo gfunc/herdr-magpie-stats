@@ -12,9 +12,10 @@ dark palette; the header and period row keep Herdr's theme.
 ## What you see
 
 The panel has four width tiers. Below 160 px it is a rail. Below 420 px it is
-narrow. Below 760 px it is medium. At 760 px and above it is wide. Narrow and
-medium keep one 560 px column. Wide keeps two 560 px columns with a 16 px gap.
-The header and period row span the content.
+narrow. Below 760 px it is medium. At 760 px and above it is wide. At every
+size the content flows in one column, as the page does. Medium caps it at
+560 px; wide caps it at 1200 px, the page's own view width. Only the
+allowance cards and the KPI strip divide into columns inside that flow.
 
 - Header row. The selected gateway's name in semibold (the built-in one is
   named "Magpie"; click the name to switch or add gateways), a status word
@@ -31,8 +32,8 @@ The header and period row span the content.
 - Cost line. `≈$2.54` in semibold, beside `effective prices`, or
   `N calls unpriced` when some calls had no known price.
 - Allowances. Cards packed into columns the way the page packs them: each
-  card goes into the shortest column, two columns at medium and wide, one in
-  narrow. A provider's several accounts share one card with an `All N
+  card goes into the shortest column, as many as fit (three at the wide cap),
+  one in narrow. A provider's several accounts share one card with an `All N
   accounts` aggregate block and a section per account. A card head carries
   the provider icon, the name, and the plan with its renewal or expiry. Each
   window shows its name, `count / limit · N% used` (or left, by the Used/Left
@@ -156,7 +157,7 @@ The header and period row span the content.
   luminance of Herdr's background color. The content area uses it; the header
   and period row keep Herdr's tokens.
 - Width constants: `RAIL_WIDTH` 160, `NARROW_WIDTH` 420, `MEDIUM_WIDTH` 760,
-  `COLUMN_WIDTH` 560, `COLUMN_GAP` 16. Change these to retune the layout.
+  `COLUMN_WIDTH` 560, `PAGE_WIDTH` 1200. Change these to retune the layout.
 
 ## Watch out
 
@@ -198,9 +199,10 @@ The header and period row span the content.
 ## Done when
 
 - `herdr-app check ~/.config/herdr-app/mods/magpie-stats` passes.
-- The + menu lists Magpie stats and opens it as a tab. Wide shows two columns
-  of 560 px. Narrowing the pane to a sidebar stacks it into one column, and
-  below 160 px it becomes the rail.
+- The + menu lists Magpie stats and opens it as a tab. The sections flow in
+  one column at every width, as on the page. Allowances come before the tiles
+  and the chart, Models below Agents, capped at 1200 px wide. Narrowing the
+  pane shrinks the card grid, and below 160 px it becomes the rail.
 - With magpie running, the panel shows Live, the cost and calls match
   `curl -s "http://127.0.0.1:3425/v1/magpie/usage?period=30d"`, and the
   allowance cards match `curl -s "http://127.0.0.1:3425/v1/magpie/quotas"`.
